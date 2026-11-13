@@ -1,0 +1,2430 @@
+// 35_0 (beauty renderer, phase 7): denoiser (edge-aware, guided by the first-hit normal, depth and base color),
+//       fast preview while moving (2 x 2 or 4 x 4 pixel blocks), first-hit guide pictures. Main view only.
+// 34_0 (beauty renderer, phases 5 + 6): real rounded geometry (case shell, LED body, pins), real marking text on the
+//       case top, optional circuit board above the chip; camera with a real aperture (depth of field, autofocus),
+//       bloom, vignette and chromatic aberration. Main view only: the sensor kernels are unchanged.
+// 33_0 (beauty renderer, phases 1-4): the main view is a new path tracer with physical materials, studio lights,
+//       an environment and a tone curve (see the 33_0 block at the end of this file).
+//       The sensor kernels and all hit tests are the 32_0 code, unchanged. Drawing only.
+// 32_0 (main view looks): the LED is drawn like a real 1206 chip LED: white substrate base with gold end terminals and
+//       a green polarity mark, water-clear epoxy top (view ray bent at the epoxy face, index 1.5), and under the epoxy the
+//       gold pads, the die and its bond wire. The die glows red (stand-in for 850 nm). Drawing only: same light on the paper.
+// 31_0 (main view looks): the sensor case is drawn like a real molded optical-mouse sensor package (user photo):
+//       grey speckled molded body, black base frame on the optical side, rounded-edge shading, gold ring around the
+//       aperture, closed top with mold dimples and laser marking, 4 gold pins per X side (materials 19, 20).
+//       Drawing only: CSSensor still uses IntersectHousing with the matte black reflectance. Sensor image unchanged.
+// 30_0 (stage 7, paper): light spreads inside the paper. A sensor ray that sees paper point P gets the LED light that
+//       entered at a nearby point P' (exponential distance, mean _SpreadDist; Arney et al. 1999). Ink is crossed twice
+//       (at P' going in, at P coming out). Spread 0 = exactly as 29_0. Main view unchanged.
+// 29_0 (main view fix): no more flicker on the sensor. The glass top and the sensor lie in the same plane, so both were hit
+//       at the same distance and the winner changed from frame to frame. Now the sensor always wins inside its square.
+// 28_0 (main view fix): the chip glass touches the sensor (no air gap, as on the real chip). A view ray inside the glass
+//       that reaches the glass top lands on the sensor (or on the die outside it): no total reflection, no extra bend.
+//       Seen from above, a ray passing the sensor enters the glass with the right bend. Sensor physics unchanged.
+// 27_0 (view): one show/hide switch per main-view object (_ShowMask bits). Drawing only: the sensor kernel (CSSensor)
+//       always uses every object. Chief-ray arrows split into up (lens -> sensor) and down (lens -> surface).
+// 26_0 (speed): vignetting check in C# only on changes (that was the 23_0 frame drop). Stray ray on 1 of every 16 grid
+//       points (4 x 4 spacing), weighted x 16, same average. Stray path skips the fiber-shadow search (invisible in a haze).
+// 25_0 (speed + looks): main view bounces limited (_MainBounces, roulette from bounce 3), stray ray only on
+//       selected frames (_StrayThisFrame, last stray value kept), dark silicon die drawn above the chip glass (material 18).
+// 24_0 (stage 6.3): stray light on the sensor. (1) housing bounce: pixel -> black housing -> pinhole -> lens -> paper,
+//       (2) lens ghosts: random reflect / pass at each lens face, (3) natural falloff (cos^4). Clean and stray light are
+//       kept apart (SensorImage: r = shown, g = clean, b = stray). CSMain: Russian roulette now boosts the survivors.
+// 23_0 (stage 6.2): chip glass 0.405 mm on the die. Sensor rays bend at the glass bottom (Snell), the floor test uses the
+//       bent ray, each ray x glass transmission. Pinhole on the lens axis (_PinholeXZ), chip/housing off the axis. Glass drawn in the main view.
+// 22_0: CSSensor runs one GPU thread per ray: one thread group per pixel, an N x N grid of rays inside the pixel
+//       (kernels CSSensor4 / CSSensor8 / CSSensor16), summed in shared memory. The ray path is unchanged.
+// 21_0: identical to 16_0_to_20_0 (groups per tile are made in Main_SimulationSensor_21_0.cs)
+// 20_0: surface marks (dot, cross, line, square) painted into a reflectance map that works on every surface. Based on 16_0_to_19_0 (stage 6.1 vignetting kept).
+#pragma kernel CSMain
+#pragma kernel CSFinal
+#pragma kernel CSBloomPre
+#pragma kernel CSBloomBlur
+#pragma kernel CSFocus
+#pragma kernel CSDenoise
+#pragma kernel CSSensor4
+#pragma kernel CSSensor8
+#pragma kernel CSSensor16
+
+#define SAMPLES_PER_FRAME 64
+#define GLASS_ENV_COLOR float3(2.0f, 2.2f, 2.6f)   // brightness of the environment reflected by the glass
+#define LED_DISPLAY_MIN_NM 650.0f                   // 17_0: main view only - LED window glows from here to 780 nm (red stand-in for 850 nm)
+#define LED_DISPLAY_COLOR float3(1.0f, 0.08f, 0.05f) // 17_0: main view only - red tint of the LED light on the paper (display color, not measured)
+#define HOUSING_BLACK float3(0.04f, 0.04f, 0.04f)    // 17_0: matte black plastic, 4 % (24_0: carbon black, near-infrared reflectance 0.04, LBNL pigment database)
+
+// --- Scale: 1 scene unit = 10 mm (1 cm) ---
+#define MM_TO_UNIT 0.1f
+#define T_EPS 0.0001f   // ray-hit tolerance (was 0.001 when 1 unit = 1 mm)
+
+// --- Arrow head (cone) at the end of each chief-ray vector ---
+#define ARROW_HEAD_RADIUS 3.0f    // cone base radius / drawn line radius
+#define ARROW_HEAD_LENGTH 3.0f    // cone length / cone base radius
+#define ARROW_HEAD_MAX    0.45f   // largest cone base radius / pixel spacing (keeps neighbouring cones apart)
+
+// --- Plane settings ---
+float3 _SensorCenter;
+float2 _SensorHalfSize;
+float2 _SensorGridCells;
+float  _SensorGridEnabled;
+float  _SensorLineWidth;
+float  _SensorBorderWidth;
+float4 _SensorColor;
+float4 _SensorGridColor;
+float4 _SensorBorderColor;
+
+// 14_0: paper surface (height map of fibers, made in C#, values in scene units, mean height 0)
+float3 _PatchCenter;         // y = mean height of the paper
+float  _PatchHalfSize;
+Texture2D<float> _PaperHeight;
+SamplerState sampler_PaperHeight;   // repeat + bilinear, from the texture settings
+float  _PaperHeightMin;      // lowest point of the map
+float  _PaperHeightMax;      // highest point of the map
+float  _PaperTileSize;       // size of one map tile
+float  _PaperTexel;          // size of one map texel
+float  _PaperReflectance;    // matte reflectance (0..1)
+Texture2D<float> _MarkMap;   // 20_0: mark coverage (0 = surface, 1 = ink), same tile as _PaperHeight
+float  _MarkReflectance;     // 20_0: reflectance of the ink
+float  _MarksEnabled;        // 20_0: 1 = show the marks
+float  _PaperRefDist2;       // squared LED distance to the paper point on the sensor axis
+
+// Sensor housing (open top box, floor with a round pinhole)
+float3 _HousingCenter;       // x,z = axis of the housing, y = underside of the floor
+float3 _HousingSize;         // x = half width, y = total height, z = half depth
+float  _HousingWall;         // side wall thickness
+float  _HousingFloor;        // 12_0: floor (pinhole plate) thickness, separate from the walls
+float2 _PinholeXZ;           // 23_0: pinhole / lens axis (x, z); the housing and holder are centered on the chip instead
+float  _GlassBottomY;        // 23_0: chip glass bottom (chip face) height
+float  _GlassIndex;          // 23_0: chip glass index at 850 nm
+float  _GlassShift;          // 23_0: glass thickness - thickness / index (apparent rise of the die)
+float3 _ChipGlassCenter;     // 23_0: chip glass block (main view)
+float3 _ChipGlassHalf;
+float  _PinholeRadius;       // radius of the hole in the middle of the floor
+float  _HousingWallBottom;   // 16_0: light shield - the walls reach down to this height (below the floor)
+
+// 16_0 LED (Lite-On LTE-C216-P-W). _LightPosition is the window center.
+float3 _LedAim;              // window normal, toward the paper spot under the lens
+float3 _LedAxisL;            // body length direction
+float3 _LedAxisW;            // body width direction
+float3 _LedHalf;             // half sizes: x = length, y = along the aim (body height), z = width
+float  _LedBase;             // base thickness, at the back of the body
+float  _LedWindowRadius;     // round window on the front face
+float  _LedBeamPower;        // beam pattern cos^m
+
+// Chief-ray vectors (one per sensor pixel)
+float3 _RayApexTop;          // lens point on the sensor side (rear principal point)
+float3 _RayApexBottom;       // lens point on the surface side (front principal point)
+float  _FocusPlaneY;         // height of the surface the vectors end on
+float  _SurfaceRatio;        // object distance / image distance (surface offset per sensor offset)
+float  _VectorRadius;        // base thickness of the drawn vectors
+
+// Mouse optics
+float  _LensY;
+float  _LensRadius;
+float  _SensorImageDist;
+float  _ObjectDist;
+float  _SensorBlend;
+float  _HousingReflectance;  // 24_0: matte reflectance of the black housing at 850 nm
+int    _StrayBounces;        // 24_0: housing bounces followed for stray light (0 = off)
+float  _LensGhosts;          // 24_0: 1 = lens faces reflect or pass at random (Fresnel), 0 = only weaken the ray
+float  _NaturalFalloff;      // 24_0: 1 = cos^4 falloff toward the sensor edges
+int    _SensorView;
+int    _MainBounces;         // 25_0: most bounces of a main-view ray
+float  _StrayThisFrame;      // 25_0: 1 = trace the stray ray this frame, 0 = keep the last stray value
+float3 _ChipDieCenter;       // 25_0: silicon die block (main view)
+float3 _ChipDieHalf;          // 24_0: 0 = all light, 1 = clean only, 2 = stray only
+float  _ShowSensorImage;
+float  _SensorExposure;
+float  _SpreadDist;          // 30_0: mean distance light travels inside the paper before coming back out (scene units, 0 = off)
+int    _ShowMask;            // 27_0: main view objects, one bit each (see ShowObj)
+static float gMarkView = 1.0f;   // 27_0: 1 = marks drawn; set to 0 in CSMain when Show Marks is off (sensor keeps 1)
+// 27_0: 0 surface, 1 marks, 2 ground, 3 LED body, 4 LED glow, 5 lens, 6 lens holder, 7 housing floor, 8 housing walls,
+//       9 chip glass, 10 silicon die, 11 sensor plane, 12 sensor image, 13 sensor grid, 14 arrows up, 15 arrows down, 16 axes
+//       31_0: 17 case pins, 18 case top face, 19 real case look (off = matte black housing as in 30_0)
+bool ShowObj(int k) { return ((_ShowMask >> k) & 1) != 0; }
+float4 _PinSize;             // 31_0: x = width, y = thickness, z = out from the wall, w = rise above the case top (units)
+float4 _PinPlace;            // 31_0: x = exit height, y = pitch along Z, z = case top height (units)
+float  _CaseBevel;           // 31_0: rounded-edge shading width (units, shading only)
+float  _LedDieGlow;          // 32_0: red glow of the LED die in the main view (drawing only). Show bit 20 = real LED look
+float  _LensCurvRadius;
+float  _LensThickness;
+float  _LensEdge;
+float  _LensIndex;
+float3 _HolderCenter;        // 17_0: lens holder plate center (one clear piece with the lens)
+float3 _HolderHalfSize;      // 17_0: x = half width, y = half thickness, z = half depth (inside of the walls)
+float  _UseRealLens;
+float  _SensorOpacity;
+float  _EnableLensVisuals;   // 1 = full optical lens refraction, 0 = simple 3D shaded surface
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+    float wavelength;
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    int materialID;
+};
+
+RWTexture2D<float4> Result;
+RWTexture2D<float4> AccumulationBuffer;
+RWTexture2D<float4> SensorImage;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float _Time;
+int _SampleIndex;
+
+float4 _LightPosition;
+float _LightIntensity;
+float _IntensityClamp;
+
+// --- PRNG Subsystem ---
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float3 RandomInUnitSphere(inout uint state) {
+    while (true) {
+        float3 p = float3(NextRandom(state)*2.0f-1.0f, NextRandom(state)*2.0f-1.0f, NextRandom(state)*2.0f-1.0f);
+        if (dot(p, p) < 1.0f) return p;
+    }
+    return float3(0,0,0);
+}
+
+float3 RotateAroundAxis(float3 v, float3 axis, float angle) {
+    axis = normalize(axis);
+    float s = sin(angle);
+    float c = cos(angle);
+    return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0f - c);
+}
+
+float Hash21(float2 p) {
+    float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031f);
+    p3 += dot(p3, p3.yzx + 33.33f);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float ValueNoise(float2 p) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0f - 2.0f * f);
+    float a = Hash21(i);
+    float b = Hash21(i + float2(1, 0));
+    float c = Hash21(i + float2(0, 1));
+    float d = Hash21(i + float2(1, 1));
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+float SurfaceHeight(float2 xz) {
+    // 14_0: paper fiber height map, repeated every _PaperTileSize
+    return _PaperHeight.SampleLevel(sampler_PaperHeight, xz / _PaperTileSize, 0);
+}
+
+// 20_0: reflectance at a surface point = surface value, or the ink value where a mark is painted
+float SurfaceReflectance(float3 pos) {
+    float cov = _MarkMap.SampleLevel(sampler_PaperHeight, pos.xz / _PaperTileSize, 0) * _MarksEnabled * gMarkView;   // 27_0: _MarksEnabled = physics (Marks Active), gMarkView = drawing
+    return lerp(_PaperReflectance, _MarkReflectance, saturate(cov));
+}
+
+float EvaluateEmission(int matID, float wavelength) {
+    // 17_0: the real LED is 850 nm (invisible). Main view only: the window glows in the visible red end
+    // (650-780 nm) as a stand-in color. x 400/130 keeps the same total power as the old 380-780 nm glow.
+    if (matID == 4) return (wavelength >= LED_DISPLAY_MIN_NM) ? _LightIntensity * (400.0f / (780.0f - LED_DISPLAY_MIN_NM)) : 0.0f;
+    return 0.0f;
+}
+
+float EvaluateSkyEmission(float wavelength, float3 rayDir) {
+    return 0.0f;
+}
+
+float3 WavelengthToXYZ(float wave) {
+    float x1 = 1.065f * exp(-0.5f * ((wave - 595.8f) / 33.4f) * ((wave - 595.8f) / 33.4f));
+    float x2 = 0.366f * exp(-0.5f * ((wave - 446.8f) / 18.2f) * ((wave - 446.8f) / 18.2f));
+    return float3(x1 + x2, 1.014f * exp(-0.5f * ((wave - 556.4f) / 40.4f) * ((wave - 556.4f) / 40.4f)), 1.839f * exp(-0.5f * ((wave - 446.8f) / 22.7f) * ((wave - 446.8f) / 22.7f)));
+}
+
+float3 XYZToRGB(float3 xyz) {
+    return float3(2.975424f * xyz.x - 1.402930f * xyz.y - 0.453346f * xyz.z, -0.923164f * xyz.x + 1.832263f * xyz.y + 0.035174f * xyz.z, 0.053158f * xyz.x - 1.936616f * xyz.y + 1.050730f * xyz.z);
+}
+
+// --- Intersections ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, int matID) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0f) return;
+    float t = -b - sqrt(discriminant);
+    if (t <= T_EPS) t = -b + sqrt(discriminant);
+    if (t > T_EPS && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.materialID = matID;
+    }
+}
+
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal, int matID) {
+    float denom = dot(planeNormal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+        if (t > T_EPS && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = planeNormal;
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+void IntersectSensorPlane(Ray ray, inout HitRecord bestHit, float3 center, float halfWidth, float halfDepth, int matID) {
+    float3 normal = float3(0.0f, -1.0f, 0.0f);
+    float denom = dot(normal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(center - ray.origin, normal) / denom;
+        if (t > T_EPS && t < bestHit.t) {
+            float3 hitPos = ray.origin + t * ray.direction;
+            float2 localPos = hitPos.xz - center.xz;
+            if (abs(localPos.x) <= halfWidth && abs(localPos.y) <= halfDepth) {
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = hitPos;
+                bestHit.normal = (denom < 0.0f) ? normal : -normal;
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectLensCap(Ray ray, inout HitRecord bestHit, float3 c, float sgn, int matID) {
+    float R = _LensCurvRadius;
+    float3 sc = float3(c.x, c.y + sgn * (0.5f * _LensThickness - R), c.z);
+    float3 oc = ray.origin - sc;
+    float b = dot(oc, ray.direction);
+    float cc = dot(oc, oc) - R * R;
+    float disc = b * b - cc;
+    if (disc < 0.0f) return;
+    float sq = sqrt(disc);
+    [unroll]
+    for (int j = 0; j < 2; j++) {
+        float t = (j == 0) ? (-b - sq) : (-b + sq);
+        if (t > T_EPS && t < bestHit.t) {
+            float3 p = ray.origin + t * ray.direction;
+            float2 dxz = p.xz - c.xz;
+            if (sgn * (p.y - c.y) >= 0.0f && dot(dxz, dxz) <= _LensRadius * _LensRadius * 1.0001f) {
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = p;
+                bestHit.normal = (p - sc) / R;
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectLensEdge(Ray ray, inout HitRecord bestHit, float3 c, int matID) {
+    float2 d = ray.direction.xz;
+    float a2 = dot(d, d);
+    if (a2 < 1e-8f) return;
+    float2 o = ray.origin.xz - c.xz;
+    float b = dot(o, d);
+    float cc = dot(o, o) - _LensRadius * _LensRadius;
+    float disc = b * b - a2 * cc;
+    if (disc < 0.0f) return;
+    float sq = sqrt(disc);
+    [unroll]
+    for (int j = 0; j < 2; j++) {
+        float t = ((j == 0) ? (-b - sq) : (-b + sq)) / a2;
+        if (t > T_EPS && t < bestHit.t) {
+            float3 p = ray.origin + t * ray.direction;
+            if (abs(p.y - c.y) <= 0.5f * _LensEdge * 1.0001f) {
+                float2 dxz = (p.xz - c.xz) / max(_LensRadius, 1e-6f);
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = p;
+                bestHit.normal = float3(dxz.x, 0.0f, dxz.y);
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectLensGlass(Ray ray, inout HitRecord bestHit, float3 c, int matID) {
+    IntersectLensCap(ray, bestHit, c,  1.0f, matID);
+    IntersectLensCap(ray, bestHit, c, -1.0f, matID);
+    IntersectLensEdge(ray, bestHit, c, matID);
+}
+
+// 17_0: lens caps only. With the holder plate the lens side (edge cylinder) is joined to the plate, so it is not a surface.
+void IntersectLensCaps(Ray ray, inout HitRecord bestHit, float3 c, int matID) {
+    IntersectLensCap(ray, bestHit, c,  1.0f, matID);
+    IntersectLensCap(ray, bestHit, c, -1.0f, matID);
+}
+
+// 17_0: lens holder plate = a clear box with a round hole the lens fills (one piece with the lens, same material).
+// Outside the plate: the bottom face is the glass surface (matGlass).
+// Inside the plate: the top face is glued to the floor and the sides touch the walls, so leaving there = black housing (matHousing).
+// Faces inside the hole (r < lens radius) belong to the lens and are skipped.
+void IntersectLensHolder(Ray ray, inout HitRecord bestHit, int matGlass, int matHousing) {
+    float3 bmin = _HolderCenter - _HolderHalfSize;
+    float3 bmax = _HolderCenter + _HolderHalfSize;
+    float3 invD = 1.0f / ray.direction;
+    float3 ta = (bmin - ray.origin) * invD;
+    float3 tb = (bmax - ray.origin) * invD;
+    float3 tmn = min(ta, tb);
+    float3 tmx = max(ta, tb);
+    float t0 = max(max(tmn.x, tmn.y), tmn.z);
+    float t1 = min(min(tmx.x, tmx.y), tmx.z);
+    if (!(t1 > t0 && t1 > T_EPS)) return;
+    float r2 = _LensRadius * _LensRadius;
+
+    // Entry face (ray comes from outside)
+    if (t0 > T_EPS) {
+        float3 p = ray.origin + t0 * ray.direction;
+        float2 rel = p.xz - _PinholeXZ;   // 23_0: lens hole on the lens axis
+        if (dot(rel, rel) > r2) {
+            if (t0 < bestHit.t) {
+                float3 n;
+                if (tmn.x >= tmn.y && tmn.x >= tmn.z) n = float3(-sign(ray.direction.x), 0.0f, 0.0f);
+                else if (tmn.y >= tmn.z)              n = float3(0.0f, -sign(ray.direction.y), 0.0f);
+                else                                  n = float3(0.0f, 0.0f, -sign(ray.direction.z));
+                bestHit.didIntersect = true;
+                bestHit.t = t0;
+                bestHit.position = p;
+                bestHit.normal = n;
+                bestHit.materialID = matGlass;
+            }
+            return;
+        }
+    }
+
+    // Exit face (ray is inside the plate, or entered through the lens hole)
+    float3 q = ray.origin + t1 * ray.direction;
+    float2 relq = q.xz - _PinholeXZ;   // 23_0
+    if (dot(relq, relq) <= r2 || t1 >= bestHit.t) return;
+    float3 nOut;   // outward normal of the exit face
+    bool bottom = false;
+    if (tmx.x <= tmx.y && tmx.x <= tmx.z)      nOut = float3(sign(ray.direction.x), 0.0f, 0.0f);
+    else if (tmx.y <= tmx.z)                   { nOut = float3(0.0f, sign(ray.direction.y), 0.0f); bottom = ray.direction.y < 0.0f; }
+    else                                       nOut = float3(0.0f, 0.0f, sign(ray.direction.z));
+    bestHit.didIntersect = true;
+    bestHit.t = t1;
+    bestHit.position = q;
+    bestHit.normal = bottom ? nOut : -nOut;   // glass: outward normal; housing: faces back into the plate
+    bestHit.materialID = bottom ? matGlass : matHousing;
+}
+
+// --- Sensor housing ---
+// Ray against an axis-aligned box. Returns the entry and exit distances and the normal of the entry face.
+bool BoxSlab(Ray ray, float3 bmin, float3 bmax, out float t0, out float t1, out float3 n0) {
+    float3 invD = 1.0f / ray.direction;
+    float3 ta = (bmin - ray.origin) * invD;
+    float3 tb = (bmax - ray.origin) * invD;
+    float3 tmn = min(ta, tb);
+    float3 tmx = max(ta, tb);
+    t0 = max(max(tmn.x, tmn.y), tmn.z);
+    t1 = min(min(tmx.x, tmx.y), tmx.z);
+    if (tmn.x >= tmn.y && tmn.x >= tmn.z)      n0 = float3(-sign(ray.direction.x), 0.0f, 0.0f);
+    else if (tmn.y >= tmn.z)                   n0 = float3(0.0f, -sign(ray.direction.y), 0.0f);
+    else                                       n0 = float3(0.0f, 0.0f, -sign(ray.direction.z));
+    return t1 > t0 && t1 > T_EPS;
+}
+
+void IntersectHousingBox(Ray ray, inout HitRecord bestHit, float3 bmin, float3 bmax, int matID) {
+    float t0, t1; float3 n;
+    if (!BoxSlab(ray, bmin, bmax, t0, t1, n)) return;
+    if (t0 > T_EPS && t0 < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t0;
+        bestHit.position = ray.origin + t0 * ray.direction;
+        bestHit.normal = n;
+        bestHit.materialID = matID;
+    }
+}
+
+// Floor plate with a round hole (the pinhole) through its middle.
+void IntersectHousingFloor(Ray ray, inout HitRecord bestHit, float3 bmin, float3 bmax, float2 axisXZ, float holeR, int matID) {
+    float t0, t1; float3 n;
+    if (!BoxSlab(ray, bmin, bmax, t0, t1, n)) return;
+    if (t0 <= T_EPS) return;
+
+    float3 p = ray.origin + t0 * ray.direction;
+    float2 rel = p.xz - axisXZ;
+    if (dot(rel, rel) > holeR * holeR) {
+        if (t0 < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t0;
+            bestHit.position = p;
+            bestHit.normal = n;
+            bestHit.materialID = matID;
+        }
+        return;
+    }
+
+    // The ray enters through the hole: it can still hit the wall of the hole before leaving the plate.
+    float2 d = ray.direction.xz;
+    float a = dot(d, d);
+    if (a < 1e-10f) return;                         // vertical ray: passes straight through
+    float2 o = ray.origin.xz - axisXZ;
+    float b = dot(o, d);
+    float cc = dot(o, o) - holeR * holeR;
+    float disc = b * b - a * cc;
+    if (disc < 0.0f) return;
+    float tw = (-b + sqrt(disc)) / a;               // where the ray leaves the hole
+    if (tw > t0 && tw < t1 && tw < bestHit.t) {
+        float3 pw = ray.origin + tw * ray.direction;
+        float2 rr = pw.xz - axisXZ;
+        bestHit.didIntersect = true;
+        bestHit.t = tw;
+        bestHit.position = pw;
+        bestHit.normal = float3(-rr.x, 0.0f, -rr.y) / max(holeR, 1e-6f);   // faces the axis
+        bestHit.materialID = matID;
+    }
+}
+
+// Open-top box: floor with the pinhole plus four walls.
+void IntersectHousing(Ray ray, inout HitRecord bestHit, int matID) {
+    float3 c = _HousingCenter;
+    float hw = _HousingSize.x;
+    float hd = _HousingSize.z;
+    float y0 = c.y;
+    float y1 = c.y + _HousingSize.y;
+    float w  = _HousingWall;
+    float yw = min(_HousingWallBottom, y0);   // 16_0: walls extend below the floor as the light shield
+
+    IntersectHousingFloor(ray, bestHit, float3(c.x - hw, y0, c.z - hd), float3(c.x + hw, y0 + _HousingFloor, c.z + hd), _PinholeXZ, _PinholeRadius, matID);   // 23_0: hole on the lens axis
+    IntersectHousingBox(ray, bestHit, float3(c.x - hw,     yw, c.z - hd),     float3(c.x - hw + w, y1, c.z + hd),     matID);
+    IntersectHousingBox(ray, bestHit, float3(c.x + hw - w, yw, c.z - hd),     float3(c.x + hw,     y1, c.z + hd),     matID);
+    IntersectHousingBox(ray, bestHit, float3(c.x - hw + w, yw, c.z - hd),     float3(c.x + hw - w, y1, c.z - hd + w), matID);
+    IntersectHousingBox(ray, bestHit, float3(c.x - hw + w, yw, c.z + hd - w), float3(c.x + hw - w, y1, c.z + hd),     matID);
+}
+
+// 23_0: chip glass block (main view). Entry face from outside, or the exit face when the ray is inside the glass.
+void IntersectChipGlass(Ray ray, inout HitRecord bestHit, int matID) {
+    float3 bmin = _ChipGlassCenter - _ChipGlassHalf;
+    float3 bmax = _ChipGlassCenter + _ChipGlassHalf;
+    float t0, t1; float3 n0;
+    if (!BoxSlab(ray, bmin, bmax, t0, t1, n0)) return;
+    float t = t0 > T_EPS ? t0 : t1;
+    if (t <= T_EPS || t >= bestHit.t) return;
+    float3 p = ray.origin + t * ray.direction;
+    float3 n = n0;
+    // 29_0: entering through the TOP face inside the sensor square = this is the sensor, drawn by IntersectSensorPlane.
+    // Same plane, same distance: without this the two took turns (flicker).
+    if (t0 > T_EPS && n0.y > 0.5f && ShowObj(11)) {
+        float2 relS = p.xz - _SensorCenter.xz;
+        if (abs(relS.x) <= _SensorHalfSize.x && abs(relS.y) <= _SensorHalfSize.y) return;
+    }
+    if (t0 <= T_EPS) {   // leaving: outward normal of the nearest face
+        float3 dl = abs(p - bmin), dh = abs(bmax - p);
+        float m = min(min(min(dl.x, dl.y), min(dl.z, dh.x)), min(dh.y, dh.z));
+        n = m == dl.x ? float3(-1, 0, 0) : m == dh.x ? float3(1, 0, 0) : m == dl.y ? float3(0, -1, 0) : m == dh.y ? float3(0, 1, 0) : m == dl.z ? float3(0, 0, -1) : float3(0, 0, 1);
+    }
+    // 28_0: leaving through the TOP face = the glass is bonded to the die there. The ray reaches the sensor (inside the
+    // sensor square) or the die, straight from the glass: no glass-to-air step, so no total reflection and no extra bend.
+    if (t0 <= T_EPS && n.y > 0.5f) {
+        float2 rel = p.xz - _SensorCenter.xz;
+        bool onSensor = abs(rel.x) <= _SensorHalfSize.x && abs(rel.y) <= _SensorHalfSize.y;
+        if (onSensor && ShowObj(11)) { bestHit.didIntersect = true; bestHit.t = t; bestHit.position = p; bestHit.normal = float3(0, -1, 0); bestHit.materialID = 10; return; }
+        if (ShowObj(10))             { bestHit.didIntersect = true; bestHit.t = t; bestHit.position = p; bestHit.normal = float3(0, -1, 0); bestHit.materialID = 18; return; }
+    }
+    bestHit.didIntersect = true;
+    bestHit.t = t;
+    bestHit.position = p;
+    bestHit.normal = n;
+    bestHit.materialID = matID;
+}
+
+// 25_0: silicon die (main view only): a dark opaque box above the chip glass
+void IntersectChipDie(Ray ray, inout HitRecord bestHit, int matID) {
+    IntersectHousingBox(ray, bestHit, _ChipDieCenter - _ChipDieHalf, _ChipDieCenter + _ChipDieHalf, matID);
+}
+
+// 27_0: housing for the main view, floor and walls each on their own switch (same shapes as IntersectHousing)
+void IntersectHousingParts(Ray ray, inout HitRecord bestHit, int matID, bool floorOn, bool wallsOn) {
+    float3 c = _HousingCenter;
+    float hw = _HousingSize.x;
+    float hd = _HousingSize.z;
+    float y0 = c.y;
+    float y1 = c.y + _HousingSize.y;
+    float w  = _HousingWall;
+    float yw = min(_HousingWallBottom, y0);
+    if (floorOn)
+        IntersectHousingFloor(ray, bestHit, float3(c.x - hw, y0, c.z - hd), float3(c.x + hw, y0 + _HousingFloor, c.z + hd), _PinholeXZ, _PinholeRadius, matID);
+    if (wallsOn) {
+        IntersectHousingBox(ray, bestHit, float3(c.x - hw,     yw, c.z - hd),     float3(c.x - hw + w, y1, c.z + hd),     matID);
+        IntersectHousingBox(ray, bestHit, float3(c.x + hw - w, yw, c.z - hd),     float3(c.x + hw,     y1, c.z + hd),     matID);
+        IntersectHousingBox(ray, bestHit, float3(c.x - hw + w, yw, c.z - hd),     float3(c.x + hw - w, y1, c.z - hd + w), matID);
+        IntersectHousingBox(ray, bestHit, float3(c.x - hw + w, yw, c.z + hd - w), float3(c.x + hw - w, y1, c.z + hd),     matID);
+    }
+}
+
+// 31_0: gold pins (main view only). 4 per X side, centered along Z. Each pin = a wider shoulder leaving the wall
+// plus a leg bent up toward the PCB.
+void IntersectCasePins(Ray ray, inout HitRecord bestHit, int matID) {
+    float3 c = _HousingCenter;
+    float hw = _HousingSize.x;
+    float w = _PinSize.x, t = _PinSize.y, rise = _PinSize.w;
+    float L = max(_PinSize.z, t);
+    float ye = _PinPlace.x, p = _PinPlace.y, yt = _PinPlace.z;
+    float zHalf = 1.5f * p + 0.65f * w;
+    [unroll] for (int s = 0; s < 2; s++) {
+        float sg = s == 0 ? -1.0f : 1.0f;
+        float xa = c.x + sg * hw, xb = c.x + sg * (hw + L);
+        float xc = c.x + sg * (hw + L - t);
+        // speed: one box around the 4 pins of this side first; most rays miss it and skip the 8 pin boxes
+        float bt0, bt1; float3 bn;
+        if (!BoxSlab(ray, float3(min(xa, xb), ye, c.z - zHalf), float3(max(xa, xb), yt + rise, c.z + zHalf), bt0, bt1, bn)) continue;
+        if (bt0 >= bestHit.t) continue;
+        [loop] for (int k = 0; k < 4; k++) {
+            float zc = c.z + ((float)k - 1.5f) * p;
+            IntersectHousingBox(ray, bestHit, float3(min(xa, xb), ye, zc - 0.65f * w), float3(max(xa, xb), ye + t, zc + 0.65f * w), matID);
+            IntersectHousingBox(ray, bestHit, float3(min(xc, xb), ye, zc - 0.5f * w),  float3(max(xc, xb), yt + rise, zc + 0.5f * w), matID);
+        }
+    }
+}
+
+// 31_0: closed top face of the case, flush with the chip top (drawn 2 x the hit tolerance above it so it never ties
+// with the die top or the wall rims). Seen from above only.
+void IntersectCaseTop(Ray ray, inout HitRecord bestHit, int matID) {
+    if (ray.direction.y >= 0.0f) return;
+    float yTop = _PinPlace.z + 2.0f * T_EPS;
+    float t = (yTop - ray.origin.y) / ray.direction.y;
+    if (t <= T_EPS || t >= bestHit.t) return;
+    float3 q = ray.origin + t * ray.direction;
+    float2 rel = q.xz - _HousingCenter.xz;
+    if (abs(rel.x) > _HousingSize.x || abs(rel.y) > _HousingSize.z) return;
+    bestHit.didIntersect = true;
+    bestHit.t = t;
+    bestHit.position = q;
+    bestHit.normal = float3(0.0f, 1.0f, 0.0f);
+    bestHit.materialID = matID;
+}
+
+// 31_0: case look. Returns the shaded color of a case point (material 19). Zones follow the photo:
+// grey molded body, black base frame on the optical (paper) side, grey optical face with a gold ring around the
+// aperture, closed grey top with dimples and laser marking, black inside the cavity.
+float RingMask(float2 q, float2 c, float r, float wdt) { return abs(length(q - c) - r) < wdt * 0.5f ? 1.0f : 0.0f; }
+float DiscMask(float2 q, float2 c, float r) { return length(q - c) < r ? 1.0f : 0.0f; }
+
+float3 CaseShade(float3 pos, float3 n, float3 rd) {
+    float3 c = _HousingCenter;
+    float hw = _HousingSize.x, hd = _HousingSize.z;
+    float y0 = c.y, y1 = _PinPlace.z;
+    float yFloorTop = y0 + _HousingFloor;
+    float yw = min(_HousingWallBottom, y0);
+    float3 rel = pos - c;
+    float eps = 3.0f * T_EPS;
+    bool outerX = abs(rel.x) >= hw - eps;
+    bool outerZ = abs(rel.z) >= hd - eps;
+    bool topFace = n.y > 0.5f && pos.y >= y1 - eps;
+    bool floorUnder = n.y < -0.5f && abs(pos.y - y0) < eps && !outerX && !outerZ;
+    bool outerSide = (abs(n.x) > 0.5f && outerX) || (abs(n.z) > 0.5f && outerZ);
+
+    // rounded edges: tilt the normal near the outer edges (shading only)
+    if ((outerSide || topFace) && _CaseBevel > 0.0f) {
+        float3 add = float3(0.0f, 0.0f, 0.0f);
+        float dx = hw - abs(rel.x), dz = hd - abs(rel.z);
+        if (abs(n.x) < 0.5f && dx < _CaseBevel) add.x += sign(rel.x) * (1.0f - dx / _CaseBevel);
+        if (abs(n.z) < 0.5f && dz < _CaseBevel) add.z += sign(rel.z) * (1.0f - dz / _CaseBevel);
+        if (abs(n.y) < 0.5f && y1 - pos.y < _CaseBevel) add.y += 1.0f - (y1 - pos.y) / _CaseBevel;
+        if (abs(n.y) < 0.5f && pos.y - yw < _CaseBevel) add.y -= 1.0f - (pos.y - yw) / _CaseBevel;
+        n = normalize(n + add);
+    }
+
+    // molded plastic grain (fine speckle + rare bright flecks), in mm on the face plane
+    float3 pm = pos / MM_TO_UNIT;
+    float2 uvp = abs(n.y) > 0.5f ? pm.xz : (abs(n.x) > 0.5f ? pm.zy : pm.xy);
+    float grain = 0.6f * ValueNoise(uvp * 90.0f) + 0.4f * ValueNoise(uvp * 260.0f);
+    float fleck = step(0.985f, Hash21(floor(uvp * 300.0f)));
+    float3 grey = float3(0.40f, 0.41f, 0.42f) * (0.82f + 0.36f * grain) + fleck * 0.22f;
+    float3 black = float3(0.035f, 0.035f, 0.038f) * (0.85f + 0.3f * grain);
+
+    float3 albedo = black;   // cavity inside, skirt underside, floor top
+    if (topFace) {
+        albedo = grey;
+        float2 q = rel.xz;
+        float s = min(hw, hd);
+        // center ejector hole with a darker rim
+        if (length(q) < 0.13f * s) albedo = length(q) < 0.10f * s ? float3(0.03f, 0.03f, 0.03f) : grey * 0.45f;
+        // ring of 8 small dimples
+        [loop] for (int k = 0; k < 8; k++) {
+            float a = (float)k * 0.785398f;
+            if (DiscMask(q, 0.42f * s * float2(cos(a), sin(a)), 0.045f * s) > 0.5f) albedo = grey * 0.30f;
+        }
+        // two mold rings near one corner, logo circle near the other
+        if (RingMask(q, float2(-0.62f * hw, 0.72f * hd), 0.09f * s, 0.02f * s) + RingMask(q, float2(-0.36f * hw, 0.72f * hd), 0.09f * s, 0.02f * s) > 0.5f) albedo = grey * 0.45f;
+        if (RingMask(q, float2(0.62f * hw, 0.70f * hd), 0.13f * s, 0.022f * s) > 0.5f) albedo = float3(0.70f, 0.71f, 0.72f);
+        if (abs(q.x - 0.62f * hw) < 0.02f * s && abs(q.y - 0.70f * hd) < 0.07f * s) albedo = float3(0.70f, 0.71f, 0.72f);
+        // laser marking: two rows of dot-matrix glyphs (lighter grey), near the -Z edge
+        float gh = 0.11f * s, gw = 0.065f * s, gap = 0.035f * s;
+        [loop] for (int row = 0; row < 2; row++) {
+            float vy = -0.50f * hd - (float)row * (gh + gap);
+            float2 lq = float2(q.x + 0.55f * hw, q.y - vy);           // row origin at the left
+            if (lq.x >= 0.0f && lq.y >= -gh * 0.5f && lq.y <= gh * 0.5f) {
+                float gi = floor(lq.x / (gw + gap));
+                float gx = lq.x - gi * (gw + gap);
+                if (gi < (row == 0 ? 5.0f : 4.0f) && gx < gw) {
+                    float2 cell = floor(float2(gx / gw * 3.0f, (lq.y / gh + 0.5f) * 5.0f));
+                    if (Hash21(cell + float2(gi * 7.0f + row * 31.0f, 3.0f)) > 0.42f) albedo = float3(0.72f, 0.73f, 0.74f);
+                }
+            }
+        }
+    }
+    else if (outerSide) {
+        albedo = pos.y < yFloorTop ? black : grey;   // black base frame on the optical side, grey body above
+    }
+    else if (floorUnder) {
+        // optical face: grey, with the amber aperture disc and its dark ring around the pinhole (photo)
+        albedo = grey * 0.85f;
+        float r = length(pos.xz - _PinholeXZ);
+        float R = _PinholeRadius;
+        if (r < 2.6f * R) albedo = float3(0.62f, 0.46f, 0.13f) * (0.9f + 0.2f * grain);
+        if (r > 1.75f * R && r < 1.95f * R) albedo = float3(0.10f, 0.08f, 0.03f);
+        if (r > 2.45f * R && r < 2.6f * R) albedo = float3(0.85f, 0.70f, 0.30f);
+    }
+
+    float3 L = normalize(_LightPosition.xyz - pos);
+    float ndl = saturate(dot(n, L));
+    float facing = abs(dot(n, -rd));
+    float3 H = normalize(L - rd);
+    float spec = 0.10f * pow(saturate(dot(n, H)), 60.0f) + 0.05f * pow(facing, 40.0f);
+    return albedo * (0.30f + 0.40f * facing + 0.45f * ndl) + spec;
+}
+
+// 31_0: gold-plated pin (material 20): metal, colored highlights
+float3 GoldShade(float3 pos, float3 n, float3 rd) {
+    float3 gold = float3(1.00f, 0.72f, 0.30f);
+    float3 L = normalize(_LightPosition.xyz - pos);
+    float3 H = normalize(L - rd);
+    float facing = abs(dot(n, -rd));
+    float diffuse = 0.12f + 0.45f * pow(facing, 1.5f) + 0.25f * saturate(dot(n, L));
+    float spec = 1.2f * pow(saturate(dot(n, H)), 40.0f) + 0.6f * pow(facing, 30.0f);
+    return gold * (diffuse + spec);
+}
+
+// 27_0: optics objects of the main view, each on its own switch
+void IntersectOpticsMV(Ray ray, inout HitRecord hit, float3 lensCenter) {
+    if (ShowObj(11)) IntersectSensorPlane(ray, hit, _SensorCenter, _SensorHalfSize.x, _SensorHalfSize.y, 10);
+    if (ShowObj(5))  IntersectLensCaps(ray, hit, lensCenter, 12);
+    if (ShowObj(6))  IntersectLensHolder(ray, hit, 12, 14);
+    int caseMat = ShowObj(19) ? 19 : 14;   // 31_0: real case look or plain matte black
+    IntersectHousingParts(ray, hit, caseMat, ShowObj(7), ShowObj(8));
+    if (ShowObj(9))  IntersectChipGlass(ray, hit, 12);
+    if (ShowObj(10)) IntersectChipDie(ray, hit, 18);
+    if (ShowObj(17)) IntersectCasePins(ray, hit, 20);        // 31_0
+    if (ShowObj(18)) IntersectCaseTop(ray, hit, caseMat);    // 31_0
+}
+
+// 16_0: LED body, a box turned to face the paper spot. Front face = window side (clear top), back = base.
+// The round window on the front face glows (material 4), the rest of the body is material 17.
+void IntersectLedBox(Ray ray, inout HitRecord bestHit) {
+    float3 c = _LightPosition.xyz - _LedAim * _LedHalf.y;   // body center, behind the window face
+    float3 o = ray.origin - c;
+    Ray lr;
+    lr.origin = float3(dot(o, _LedAxisL), dot(o, _LedAim), dot(o, _LedAxisW));
+    lr.direction = float3(dot(ray.direction, _LedAxisL), dot(ray.direction, _LedAim), dot(ray.direction, _LedAxisW));
+    lr.wavelength = 0.0f;
+    float t0, t1; float3 n;
+    if (!BoxSlab(lr, -_LedHalf, _LedHalf, t0, t1, n)) return;
+    if (t0 <= T_EPS || t0 >= bestHit.t) return;
+    float3 lp = lr.origin + t0 * lr.direction;
+    bool onWindow = n.y > 0.5f && dot(lp.xz, lp.xz) < _LedWindowRadius * _LedWindowRadius;
+    bestHit.didIntersect = true;
+    bestHit.t = t0;
+    bestHit.position = ray.origin + t0 * ray.direction;
+    bestHit.normal = n.x * _LedAxisL + n.y * _LedAim + n.z * _LedAxisW;
+    bestHit.materialID = onWindow ? 4 : 17;
+}
+
+// 32_0: real chip LED look (material 17). Local frame: x = length, y = along the aim (front face = +y), z = width.
+// Base (back part): white substrate, gold terminals wrapped around both ends, green polarity mark on the underside.
+// Top (front part): clear epoxy. The view ray is bent into the epoxy and followed down to the substrate top, where the
+// gold pads, the die and the bond wire are drawn. A ray that leaves through a side wall shows the pale epoxy only.
+float3 LedShade(float3 pos, float3 nW, float3 rdW, bool glowOn) {
+    float3 c = _LightPosition.xyz - _LedAim * _LedHalf.y;
+    float3 o = pos - c;
+    float3 lp = float3(dot(o, _LedAxisL), dot(o, _LedAim), dot(o, _LedAxisW));
+    float3 d  = float3(dot(rdW, _LedAxisL), dot(rdW, _LedAim), dot(rdW, _LedAxisW));
+    float3 n  = float3(dot(nW, _LedAxisL), dot(nW, _LedAim), dot(nW, _LedAxisW));
+    float hx = _LedHalf.x, hy = _LedHalf.y, hz = _LedHalf.z;
+    float yb = -hy + _LedBase;                      // substrate top = bottom of the epoxy
+    float mm = MM_TO_UNIT;
+    float facing = abs(dot(n, -d));
+    float3 white = float3(0.80f, 0.78f, 0.72f);
+    float3 gold  = float3(0.95f, 0.70f, 0.28f);
+
+    if (lp.y < yb - T_EPS) {
+        // substrate base
+        float2 uvp = (abs(n.y) > 0.5f ? lp.xz : (abs(n.x) > 0.5f ? lp.zy : lp.xy)) / mm;
+        float grain = ValueNoise(uvp * 70.0f);
+        float termLen = min(0.45f * mm, 0.6f * hx);
+        float3 col = white * (0.9f + 0.2f * grain);
+        bool isGold = false;
+        if (abs(n.x) > 0.5f) { isGold = true; col = abs(lp.z) < 0.35f * hz ? gold * 0.35f : gold; }   // end face, with the dark half-hole groove
+        else if (abs(lp.x) > hx - termLen) { isGold = true; col = gold; }                              // terminal wrapped onto the sides and underside
+        else if (n.y < -0.5f && abs(lp.x) < 0.12f * hx && abs(lp.z) < 0.6f * hz) col = float3(0.10f, 0.42f, 0.20f);   // polarity mark
+        float3 outB = col * (0.40f + 0.60f * facing);
+        if (isGold) outB += gold * 0.6f * pow(facing, 20.0f);
+        return outB;
+    }
+
+    // clear epoxy
+    float3 inside = float3(0.50f, 0.55f, 0.57f) * (0.30f + 0.45f * facing);   // looking through to a far wall
+    float3 r = refract(d, n, 1.0f / 1.5f);
+    bool seesFloor = false;
+    if (r.y < -1e-4f) {
+        float t = (yb - lp.y) / r.y;
+        float3 q = lp + t * r;
+        if (abs(q.x) <= hx && abs(q.z) <= hz) {
+            seesFloor = true;
+            float3 col = white;
+            float padZ = 0.80f * hz;
+            bool padA = q.x < 0.18f * hx && abs(q.z) < padZ;        // die pad, reaches the center
+            bool padB = q.x > 0.40f * hx && abs(q.z) < padZ;        // wire pad
+            if (padA || padB) col = gold * 0.85f;
+            if (q.x > 0.0f && q.x < 0.62f * hx && abs(q.z) < 0.02f * mm) col = float3(1.0f, 0.82f, 0.42f);   // bond wire
+            float dh = 0.15f * mm;                                   // die 0.30 mm square
+            bool onDie = abs(q.x) < dh && abs(q.z) < dh;
+            if (onDie) col = length(q.xz) < 0.045f * mm ? gold : float3(0.09f, 0.09f, 0.11f);   // top contact on the dark die
+            inside = col * (0.35f + 0.55f * saturate(-r.y));
+            if (glowOn) {
+                float dist = length(q.xz);
+                float glow = (onDie ? 1.0f : 0.0f) + 0.35f * exp(-dist / (0.22f * mm));
+                inside += LED_DISPLAY_COLOR * (_LedDieGlow * glow);
+            }
+        }
+    }
+    if (!seesFloor && glowOn) inside += LED_DISPLAY_COLOR * (_LedDieGlow * 0.04f);   // a little light scattered in the epoxy
+    float fres = 0.04f + 0.96f * pow(1.0f - facing, 5.0f);
+    float3 outE = lerp(inside, float3(0.90f, 0.95f, 1.00f), fres);
+    if (n.y > 0.5f && abs(length(lp.xz) - _LedWindowRadius) < 0.02f * mm) outE += 0.10f;   // edge of the round window
+    return outE;
+}
+
+// --- Chief-ray vectors ---
+// Cone with its tip at V. axisA is the unit axis from the tip to the base. The base is a closed disc.
+void IntersectArrowHead(Ray ray, inout HitRecord bestHit, float3 V, float3 axisA, float len, float baseR, int matID) {
+    // Solved around the point of the ray nearest the tip: keeps float precision at this small size.
+    float tMid = dot(V - ray.origin, ray.direction);
+    float3 co = ray.origin + tMid * ray.direction - V;
+    float da = dot(ray.direction, axisA);
+    float ca = dot(co, axisA);
+    float k = baseR / len;
+    float cos2 = 1.0f / (1.0f + k * k);
+
+    float best = 1e20f;
+    float3 bestN = float3(0.0f, 0.0f, 0.0f);
+
+    // Side of the cone
+    float qa = da * da - cos2;
+    float qb = 2.0f * da * ca;
+    float qc = ca * ca - dot(co, co) * cos2;
+    float disc = qb * qb - 4.0f * qa * qc;
+    if (abs(qa) > 1e-9f && disc >= 0.0f) {
+        float sq = sqrt(disc);
+        [unroll]
+        for (int j = 0; j < 2; j++) {
+            float s = (-qb + ((j == 0) ? -sq : sq)) / (2.0f * qa);
+            float hgt = ca + s * da;                     // distance from the tip along the axis
+            if (hgt >= 0.0f && hgt <= len && s < best && tMid + s > T_EPS) {
+                float3 radial = co + s * ray.direction - axisA * hgt;
+                best = s;
+                bestN = normalize(normalize(radial) - axisA * k);
+            }
+        }
+    }
+
+    // Base disc
+    if (abs(da) > 1e-6f) {
+        float s = (len - ca) / da;
+        float3 rel = co + s * ray.direction - axisA * len;
+        if (dot(rel, rel) <= baseR * baseR && s < best && tMid + s > T_EPS) {
+            best = s;
+            bestN = axisA;
+        }
+    }
+
+    float t = tMid + best;
+    if (best < 1e19f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = bestN;
+        bestHit.materialID = matID;
+    }
+}
+
+// One arrow from A to Q: a thin line from A, then a cone whose tip is exactly at Q.
+// The line is drawn by closest approach between the camera ray and the segment.
+void TestVectorSegment(Ray ray, inout HitRecord bestHit, float3 A, float3 Q, float headMaxR, int matID) {
+    float3 full = Q - A;
+    float fullLen = length(full);
+    if (fullLen < 1e-6f) return;
+    float3 dirAQ = full / fullLen;
+
+    // Same growth with distance as the line, so the head stays visible with it.
+    float tTip = max(dot(Q - ray.origin, ray.direction), 0.0f);
+    float headR = min((_VectorRadius + tTip * 0.0006f) * ARROW_HEAD_RADIUS, headMaxR);
+    float headL = min(headR * ARROW_HEAD_LENGTH, 0.5f * fullLen);
+    IntersectArrowHead(ray, bestHit, Q, -dirAQ, headL, headR, matID);
+
+    float3 u = full - dirAQ * headL;                // the line stops at the base of the cone
+    float3 w0 = ray.origin - A;
+    float b = dot(ray.direction, u);
+    float c2 = dot(u, u);
+    float d = dot(ray.direction, w0);
+    float e = dot(u, w0);
+    float den = c2 - b * b;
+    if (den < 1e-12f) return;
+    float s = saturate((e - b * d) / den);
+    float t = s * b - d;
+    if (t <= T_EPS || t >= bestHit.t) return;
+    float3 diff = (ray.origin + t * ray.direction) - (A + s * u);
+    float r = _VectorRadius + t * 0.0006f;          // keeps the lines visible at any distance
+    if (dot(diff, diff) > r * r) return;
+    bestHit.didIntersect = true;
+    bestHit.t = t;
+    bestHit.position = ray.origin + t * ray.direction;
+    bestHit.normal = -ray.direction;
+    bestHit.materialID = matID;
+}
+
+// Lattice node (i,j) = (qStart.x + i*qStep.x, yPlane, qStart.y + j*qStep.y).
+// Only the nodes next to the plane that holds both the apex and the camera ray can be hit,
+// so each row (or column) tests two nodes instead of all of them.
+void IntersectVectorFan(Ray ray, inout HitRecord bestHit, float3 A, float yPlane, float2 qStart, float2 qStep, int nx, int nz, int matID) {
+    float3 m = cross(ray.origin - A, ray.direction);
+    if (dot(m, m) < 1e-14f) return;
+    float c = m.y * (yPlane - A.y);
+    float headMaxR = ARROW_HEAD_MAX * min(abs(qStep.x), abs(qStep.y));
+
+    if (abs(m.x * qStep.x) >= abs(m.z * qStep.y)) {
+        if (abs(m.x) < 1e-9f) return;
+        [loop]
+        for (int j = 0; j < nz; j++) {
+            float qz = qStart.y + j * qStep.y;
+            float qx = (-c - m.z * (qz - A.z)) / m.x + A.x;
+            int i0 = (int)floor((qx - qStart.x) / qStep.x);
+            [unroll]
+            for (int k = 0; k < 2; k++) {
+                int i = i0 + k;
+                if (i < 0 || i >= nx) continue;
+                TestVectorSegment(ray, bestHit, A, float3(qStart.x + i * qStep.x, yPlane, qz), headMaxR, matID);
+            }
+        }
+    } else {
+        if (abs(m.z) < 1e-9f) return;
+        [loop]
+        for (int i = 0; i < nx; i++) {
+            float qx = qStart.x + i * qStep.x;
+            float qz = (-c - m.x * (qx - A.x)) / m.z + A.z;
+            int j0 = (int)floor((qz - qStart.y) / qStep.y);
+            [unroll]
+            for (int k = 0; k < 2; k++) {
+                int j = j0 + k;
+                if (j < 0 || j >= nz) continue;
+                TestVectorSegment(ray, bestHit, A, float3(qx, yPlane, qStart.y + j * qStep.y), headMaxR, matID);
+            }
+        }
+    }
+}
+
+// Set 1 (ID 15): lens -> each sensor pixel.  Set 2 (ID 16): lens -> the surface point each pixel sees.
+void IntersectChiefVectors(Ray ray, inout HitRecord bestHit) {
+    int nx = (int)max(_SensorGridCells.x, 1.0f);
+    int nz = (int)max(_SensorGridCells.y, 1.0f);
+    float2 halfSz = _SensorHalfSize;
+    float2 pixStep = float2(2.0f * halfSz.x / nx, 2.0f * halfSz.y / nz);
+    float2 offset0 = float2(-halfSz.x + 0.5f * pixStep.x, -halfSz.y + 0.5f * pixStep.y);   // first pixel centre, relative to the sensor centre
+
+    // sensor side
+    float2 sensorStart = _SensorCenter.xz + offset0;
+    if (ShowObj(14)) IntersectVectorFan(ray, bestHit, _RayApexTop, _SensorCenter.y, sensorStart, pixStep, nx, nz, 15);   // 27_0: arrows up
+
+    // surface side: the lens inverts the image, so offsets are mirrored and scaled by object / image distance
+    float2 surfStart = _SensorCenter.xz - offset0 * _SurfaceRatio;
+    float2 surfStep  = -pixStep * _SurfaceRatio;
+    if (ShowObj(15)) IntersectVectorFan(ray, bestHit, _RayApexBottom, _FocusPlaneY, surfStart, surfStep, nx, nz, 16);   // 27_0: arrows down
+}
+
+void IntersectBillboardAxis(Ray ray, inout HitRecord bestHit, float3 axisDir, float width, int matID) {
+    float3 camForward = _CameraToWorld._m02_m12_m22;
+    float3 s = cross(axisDir, camForward);
+    if (dot(s, s) < 1e-4f) {
+        s = cross(axisDir, _CameraToWorld._m01_m11_m21);
+    }
+    s = normalize(s);
+    float3 n = normalize(cross(axisDir, s));
+
+    float denom = dot(n, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = -dot(n, ray.origin) / denom;
+        if (t > T_EPS && t < bestHit.t) {
+            float3 hitPos = ray.origin + t * ray.direction;
+            float sideCoord = dot(hitPos, s);
+            if (abs(sideCoord) <= width * 0.5f) {
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = hitPos;
+                bestHit.normal = (denom < 0.0f) ? n : -n;
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectRoughPatch(Ray ray, inout HitRecord bestHit, float3 center, float halfSize, int matID) {
+    float minY = center.y + _PaperHeightMin;
+    float maxY = center.y + _PaperHeightMax;
+
+    float3 bmin = float3(center.x - halfSize, minY, center.z - halfSize);
+    float3 bmax = float3(center.x + halfSize, maxY, center.z + halfSize);
+    float3 invD = 1.0f / ray.direction;
+    float3 t0 = (bmin - ray.origin) * invD;
+    float3 t1 = (bmax - ray.origin) * invD;
+    float3 tsm = min(t0, t1);
+    float3 tbg = max(t0, t1);
+    float tEnter = max(max(tsm.x, tsm.y), max(tsm.z, T_EPS));
+    float tExit  = min(min(tbg.x, tbg.y), tbg.z);
+    if (tEnter >= tExit || tEnter > bestHit.t) return;
+
+    const int STEPS = 64;
+    float dt = (tExit - tEnter) / (float)STEPS;
+    float tPrev = tEnter;
+    float3 pPrev = ray.origin + tPrev * ray.direction;
+    float hPrev = pPrev.y - (center.y + SurfaceHeight(pPrev.xz - center.xz));
+
+    [loop]
+    for (int s = 1; s <= STEPS; s++) {
+        float tCur = tEnter + dt * s;
+        float3 pCur = ray.origin + tCur * ray.direction;
+        float hCur = pCur.y - (center.y + SurfaceHeight(pCur.xz - center.xz));
+
+        if (hPrev > 0.0f && hCur <= 0.0f) {
+            float tLo = tPrev, tHi = tCur;
+            [unroll]
+            for (int b = 0; b < 5; b++) {
+                float tMid = 0.5f * (tLo + tHi);
+                float3 pm = ray.origin + tMid * ray.direction;
+                float hm = pm.y - (center.y + SurfaceHeight(pm.xz - center.xz));
+                if (hm > 0.0f) tLo = tMid; else tHi = tMid;
+            }
+            float tHit = 0.5f * (tLo + tHi);
+
+            if (tHit < bestHit.t) {
+                float3 pos = ray.origin + tHit * ray.direction;
+                float2 q = pos.xz - center.xz;
+                float e = _PaperTexel * 0.5f;   // 14_0: slope measured over half a map texel
+                float h0 = SurfaceHeight(q);
+                float hx = SurfaceHeight(q + float2(e, 0)) - h0;
+                float hz = SurfaceHeight(q + float2(0, e)) - h0;
+                bestHit.didIntersect = true;
+                bestHit.t = tHit;
+                bestHit.position = pos;
+                bestHit.normal = normalize(float3(-hx, e, -hz));
+                bestHit.materialID = matID;
+            }
+            return;
+        }
+        tPrev = tCur;
+        hPrev = hCur;
+    }
+}
+
+// 14_0: matte (Lambertian) paper lit by the LED.
+// brightness = reflectance x cos(angle to LED) x (reference distance / distance)^2 x (1 if the LED is visible, 0 if a fiber blocks it)
+// 1.0 = perfect white paper facing the LED at the distance of the paper point on the sensor axis.
+float PaperShade(float3 pos, float3 normal, bool withShadow) {
+    float3 toL = _LightPosition.xyz - pos;
+    float d2 = max(dot(toL, toL), 1e-12f);
+    float3 Ldir = toL * rsqrt(d2);
+    float cosI = saturate(dot(normal, Ldir));
+    float vis = 1.0f;
+    if (withShadow && cosI > 0.0f) {
+        Ray sr;
+        sr.origin = pos + normal * (_PaperTexel * 0.05f);
+        sr.direction = Ldir;
+        sr.wavelength = 0.0f;
+        HitRecord sh;
+        sh.didIntersect = false;
+        sh.t = sqrt(d2);
+        sh.position = float3(0, 0, 0);
+        sh.normal = float3(0, 0, 0);
+        sh.materialID = 0;
+        IntersectRoughPatch(sr, sh, _PatchCenter, _PatchHalfSize, 9);
+        IntersectHousing(sr, sh, 14);   // 19_0: the walls (light shield) and floor can block the LED light too
+        if (sh.didIntersect) vis = 0.0f;
+    }
+    // 16_0: LED beam pattern, 1 along the aim (the paper spot under the lens), half at half the beam angle
+    float beam = pow(saturate(dot(-Ldir, _LedAim)), _LedBeamPower);
+    return SurfaceReflectance(pos) * cosI * (_PaperRefDist2 / d2) * beam * vis;   // 20_0: marks change the reflectance
+}
+
+// 30_0: LED light arriving at a paper point (no reflectance): cos(angle) x distance falloff x beam x visibility
+float LedIrradiance(float3 pos, float3 normal, bool withShadow) {
+    float3 toL = _LightPosition.xyz - pos;
+    float d2 = max(dot(toL, toL), 1e-12f);
+    float3 Ldir = toL * rsqrt(d2);
+    float cosI = saturate(dot(normal, Ldir));
+    float vis = 1.0f;
+    if (withShadow && cosI > 0.0f) {
+        Ray sr;
+        sr.origin = pos + normal * (_PaperTexel * 0.05f);
+        sr.direction = Ldir;
+        sr.wavelength = 0.0f;
+        HitRecord sh;
+        sh.didIntersect = false;
+        sh.t = sqrt(d2);
+        sh.position = float3(0, 0, 0);
+        sh.normal = float3(0, 0, 0);
+        sh.materialID = 0;
+        IntersectRoughPatch(sr, sh, _PatchCenter, _PatchHalfSize, 9);
+        IntersectHousing(sr, sh, 14);
+        if (sh.didIntersect) vis = 0.0f;
+    }
+    float beam = pow(saturate(dot(-Ldir, _LedAim)), _LedBeamPower);
+    return cosI * (_PaperRefDist2 / d2) * beam * vis;
+}
+
+// 30_0: share of light the ink lets through on ONE pass (1 on bare paper). Ink is crossed twice (in and out), so two passes
+// give the 20_0 mark reflectance: paper x f x f = mark reflectance.
+float InkPass(float3 pos) {
+    return sqrt(saturate(SurfaceReflectance(pos) / max(_PaperReflectance, 1e-4f)));
+}
+
+// 30_0 (stage 7): paper brightness seen at P, with the light spreading inside the paper.
+// The light came in at P' near P: distance r = -SpreadDist x ln(u) (exponential), random direction, on the real bumpy surface.
+// brightness = LED light at P' x paper reflectance x ink pass at P' x ink pass at P.  SpreadDist = 0 gives PaperShade (29_0).
+float PaperShadeSpread(float3 pos, float3 normal, bool withShadow, inout uint rng) {
+    float result = 0.0f;
+    if (_SpreadDist <= 0.0f) {
+        result = PaperShade(pos, normal, withShadow);
+    } else {
+    float u = max(NextRandom(rng), 1e-6f);
+    float r = min(-_SpreadDist * log(u), 8.0f * _SpreadDist);
+    float a = 6.2831853f * NextRandom(rng);
+    float2 q = pos.xz + r * float2(cos(a), sin(a));
+    float2 qc = q - _PatchCenter.xz;
+    float e = _PaperTexel * 0.5f;
+    float h0 = SurfaceHeight(qc);
+    float hx = SurfaceHeight(qc + float2(e, 0)) - h0;
+    float hz = SurfaceHeight(qc + float2(0, e)) - h0;
+    float3 pIn = float3(q.x, _PatchCenter.y + h0, q.y);
+    float3 nIn = normalize(float3(-hx, e, -hz));
+    result = LedIrradiance(pIn, nIn, withShadow) * _PaperReflectance * InkPass(pIn) * InkPass(pos);
+    }
+    return result;
+}
+
+// 24_0: an empty hit record that only accepts hits nearer than tMax
+HitRecord NoHit(float tMax) {
+    HitRecord h;
+    h.didIntersect = false;
+    h.t = tMax;
+    h.position = float3(0, 0, 0);
+    h.normal = float3(0, 0, 0);
+    h.materialID = 0;
+    return h;
+}
+
+// 24_0: matte (cosine-weighted) random direction around the normal N
+float3 CosineDir(float3 N, inout uint rng) {
+    float u1 = NextRandom(rng);
+    float ph = 6.2831853f * NextRandom(rng);
+    float sr = sqrt(u1);
+    float3 T = normalize(abs(N.y) < 0.9f ? cross(N, float3(0, 1, 0)) : cross(N, float3(1, 0, 0)));
+    float3 B = cross(N, T);
+    return normalize(T * (sr * cos(ph)) + B * (sr * sin(ph)) + N * sqrt(1.0f - u1));
+}
+
+// 24_0: follows a ray that arrives at the real lens from above, through the lens, down to the paper.
+// Returns the paper light it finds (0 if the ray is lost). ghost = true if it reflected inside the lens on the way.
+// Lens Ghosts ON: each lens face reflects or passes at random with the Fresnel chance. OFF: the ray is only weakened (as before 24_0).
+float LensToPaper(Ray ray, float3 C, inout uint rng, out bool ghost, bool withShadow) {   // 26_0: withShadow
+    ghost = false;
+    float F0 = pow((_LensIndex - 1.0f) / (_LensIndex + 1.0f), 2.0f);
+    float weight = 1.0f;
+    bool inside = false;
+    bool exited = false;
+    [loop]
+    for (int k = 0; k < 8; k++) {
+        HitRecord lh = NoHit(1e20f);
+        IntersectLensGlass(ray, lh, C, 12);
+        if (!lh.didIntersect) break;
+
+        float3 N = lh.normal;
+        bool entering = dot(ray.direction, N) < 0.0f;
+        if (!entering && !inside) break;
+        if (!entering) N = -N;
+
+        float eta = entering ? (1.0f / _LensIndex) : _LensIndex;
+        float cosI = saturate(dot(-ray.direction, N));
+        float fres = F0 + (1.0f - F0) * pow(1.0f - cosI, 5.0f);
+        float3 refr = refract(ray.direction, N, eta);
+        bool tir = dot(refr, refr) < 1e-6f;
+
+        bool doReflect = false;
+        if (_LensGhosts > 0.5f) doReflect = tir || NextRandom(rng) < fres;
+        else { if (tir) break; weight *= (1.0f - fres); }
+
+        if (doReflect) {
+            if (!inside) break;                    // reflected off the outside of the lens: goes back up, lost
+            ghost = true;
+            ray.origin = lh.position;
+            ray.direction = normalize(reflect(ray.direction, N));
+            continue;
+        }
+        ray.origin = lh.position;
+        ray.direction = normalize(refr);
+        inside = entering;
+        if (!entering) { exited = true; break; }
+    }
+    if (!exited || ray.direction.y >= 0.0f) return 0.0f;   // lost, or left the lens upward
+
+    HitRecord hit = NoHit(1e20f);
+    IntersectRoughPatch(ray, hit, _PatchCenter, _PatchHalfSize, 9);
+    IntersectHousing(ray, hit, 14);   // 19_0: a housing hit before the paper gives black
+    if (hit.didIntersect && hit.materialID == 9)
+        return weight * PaperShadeSpread(hit.position, hit.normal, withShadow, rng);   // 30_0: light spreads inside the paper
+    return 0.0f;
+}
+
+// 22_0: one grid point inside one pixel. Returns (clean light, stray light).
+// Clean (as before): pixel -> glass bend -> pinhole floor test -> lens -> paper.
+// 24_0 stray: pixel -> any downward direction -> black housing -> (bounce) -> pinhole -> lens -> paper, plus lens ghosts.
+// Both use one scale: 1 = the light a center pixel gets from paper of brightness 1 through the whole lens opening.
+float2 SensorRay(uint2 pixel, uint2 sub, uint n, uint w, uint h, inout uint rng) {
+    float2 result = float2(0.0f, 0.0f);
+    float3 C = float3(_SensorCenter.x, _LensY, _SensorCenter.z);
+    // 22_0: grid point (sub) inside the pixel, with a small random shift inside its cell
+    float2 pix = (float2(pixel) + (float2(sub) + float2(NextRandom(rng), NextRandom(rng))) / (float)n) / float2(w, h);
+    float3 P = float3(_SensorCenter.x + (pix.x * 2.0f - 1.0f) * _SensorHalfSize.x,
+                      _SensorCenter.y,
+                      _SensorCenter.z + (pix.y * 2.0f - 1.0f) * _SensorHalfSize.y);
+    float3 Pv = P - float3(0.0f, _GlassShift, 0.0f);   // 23_0: the die as seen through the glass
+    float gF0 = (_GlassIndex - 1.0f) / (_GlassIndex + 1.0f);
+    gF0 *= gF0;
+
+    // ------------------------------------------------ clean path ------------------------------------------------
+    float r = _LensRadius * sqrt(NextRandom(rng));
+    float a = 6.2831853f * NextRandom(rng);
+    float3 L = C + float3(r * cos(a), 0.0f, r * sin(a));
+    float weight = 1.0f;
+
+    // 23_0 (stage 6.2): the ray leaves the die inside the glass and bends at the glass bottom (sin air = n sin glass).
+    // Find the bend point G on the glass bottom between P and L (halving the interval), then go on from G.
+    float3 G = P;
+    {
+        float tG = P.y - _GlassBottomY;
+        float hA = _GlassBottomY - L.y;
+        float2 d = L.xz - P.xz;
+        float D = length(d);
+        if (tG > 1e-7f && hA > 1e-7f) {
+            float lo = 0.0f, hi = D;   // horizontal distance covered inside the glass
+            [loop]
+            for (int it = 0; it < 24; it++) {
+                float x = 0.5f * (lo + hi);
+                float sinGlass = x / sqrt(x * x + tG * tG);
+                float y = D - x;
+                float sinAir = y / sqrt(y * y + hA * hA);
+                if (_GlassIndex * sinGlass < sinAir) lo = x; else hi = x;
+            }
+            float xg = 0.5f * (lo + hi);
+            G = float3(P.x, _GlassBottomY, P.z);
+            if (D > 1e-9f) G.xz += d * (xg / D);
+        }
+        // light lost at the glass face (Fresnel, air side angle)
+        float cosA = saturate(-normalize(L - G).y);
+        weight *= 1.0f - (gF0 + (1.0f - gF0) * pow(1.0f - cosA, 5.0f));
+    }
+
+    // 24_0 natural falloff: a slanted ray brings less light (cos^4), 1 on the axis
+    if (_NaturalFalloff > 0.5f) {
+        float3 dv = L - Pv;
+        float c2 = dv.y * dv.y / max(dot(dv, dv), 1e-12f);
+        weight *= c2 * c2;
+    }
+
+    // 19_0 (stage 6.1): the ray from the glass to the lens must pass the pinhole. If the black floor
+    // (top face, underside or the rim of the hole) is hit before the lens center plane, this sample is black.
+    Ray ray;
+    ray.wavelength = 0.0f;
+    ray.origin = G;
+    ray.direction = normalize(L - G);
+    HitRecord fh = NoHit(length(L - G));
+    IntersectHousing(ray, fh, 14);
+    if (!fh.didIntersect) {
+        if (_UseRealLens > 0.5f) {
+            bool ghost;
+            float v = weight * LensToPaper(ray, C, rng, ghost, true);
+            if (ghost) result.y += v; else result.x += v;
+        } else {
+            float3 F = C + (C - Pv) * (_ObjectDist / _SensorImageDist);
+            ray.origin = L;
+            ray.direction = normalize(F - L);
+            HitRecord hit = NoHit(1e20f);
+            IntersectRoughPatch(ray, hit, _PatchCenter, _PatchHalfSize, 9);
+            IntersectHousing(ray, hit, 14);
+            if (hit.didIntersect && hit.materialID == 9) result.x += weight * PaperShadeSpread(hit.position, hit.normal, true, rng);   // 30_0
+        }
+    }
+
+    // ------------------------------------------------ stray path (24_0) ------------------------------------------------
+    // The pixel also looks at the inside of the black housing. Take one random downward direction (air side), find where it
+    // leaves the glass, and follow it to the housing. At each housing point: light arriving there from the paper through the
+    // pinhole and lens (one random lens point) x housing reflectance comes back to the pixel.
+    // 26_0: the haze is smooth, so only grid points on a 4 x 4 spacing trace it (1 of 16), weighted so the average is the same
+    uint strayStep = min(4u, n);
+    bool strayPoint = (sub.x % strayStep) == 0 && (sub.y % strayStep) == 0;
+    float strayWeight = (float)(strayStep * strayStep);
+    if (strayPoint && _StrayThisFrame > 0.5f && _StrayBounces > 0 && _UseRealLens > 0.5f && _HousingReflectance > 0.0f) {   // 25_0: only on stray frames
+        float u1 = NextRandom(rng);
+        float ph = 6.2831853f * NextRandom(rng);
+        float sinA = sqrt(u1);
+        float cosA = sqrt(1.0f - u1);
+        float3 wdir = float3(sinA * cos(ph), -cosA, sinA * sin(ph));
+        float sinG = sinA / _GlassIndex;
+        float tanG = sinG / sqrt(max(1.0f - sinG * sinG, 1e-8f));
+        float3 G2 = float3(P.x, _GlassBottomY, P.z);
+        G2.xz += float2(cos(ph), sin(ph)) * (max(P.y - _GlassBottomY, 0.0f) * tanG);
+        float thr = 1.0f - (gF0 + (1.0f - gF0) * pow(1.0f - cosA, 5.0f));   // through the glass face
+        float hApp = Pv.y - C.y;                                              // lens opening to the die, as the light feels it
+
+        Ray sray;
+        sray.wavelength = 0.0f;
+        sray.origin = G2;
+        sray.direction = wdir;
+        [loop]
+        for (int b = 0; b < 2; b++) {
+            if (b >= _StrayBounces) break;
+            HitRecord hh = NoHit(1e20f);
+            IntersectHousing(sray, hh, 14);
+            if (!hh.didIntersect) break;                         // through the pinhole: that light is the clean path
+            if (hh.position.y < _HousingCenter.y - 1e-6f) break;  // below the floor: behind the lens holder, not reachable
+            float3 W = hh.position;
+            float3 N = hh.normal;
+            thr *= _HousingReflectance;
+
+            // light reaching W from the paper, through one random point of the lens opening
+            float rr = _LensRadius * sqrt(NextRandom(rng));
+            float aa = 6.2831853f * NextRandom(rng);
+            float3 Lp = C + float3(rr * cos(aa), 0.0f, rr * sin(aa));
+            float3 dl = Lp - W;
+            float d2 = max(dot(dl, dl), 1e-12f);
+            float3 dn = dl / sqrt(d2);
+            float cosW = dot(N, dn);
+            float cosL = -dn.y;
+            if (cosW > 0.0f && cosL > 0.0f) {
+                Ray nr;
+                nr.wavelength = 0.0f;
+                nr.origin = W + N * T_EPS;
+                nr.direction = dn;
+                HitRecord nh = NoHit(sqrt(d2));
+                IntersectHousing(nr, nh, 14);
+                if (!nh.didIntersect) {
+                    bool gh;
+                    result.y += thr * LensToPaper(nr, C, rng, gh, false) * cosW * cosL * hApp * hApp / d2 * strayWeight;   // 26_0
+                }
+            }
+
+            // next bounce: a matte random direction off the housing
+            sray.origin = W + N * T_EPS;
+            sray.direction = CosineDir(N, rng);
+        }
+    }
+    return result;
+}
+
+groupshared float gsSensorSum[256];     // 22_0: clean light, one value per thread of the group (max 16 x 16)
+groupshared float gsSensorStray[256];   // 24_0: stray light
+
+// 22_0: thread group = one pixel, thread = one grid point. N x N must be a power of two (16, 64, 256).
+void SensorGroup(uint2 pixel, uint2 sub, uint gi, uint n) {
+    uint w, h;
+    SensorImage.GetDimensions(w, h);
+    float2 v = float2(0.0f, 0.0f);
+    if (pixel.x < w && pixel.y < h) {
+        uint rng = GenerateSeed(pixel * n + sub, w * n, _Time);
+        v = SensorRay(pixel, sub, n, w, h, rng);
+    }
+    gsSensorSum[gi] = v.x;
+    gsSensorStray[gi] = v.y;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint s = (n * n) >> 1; s > 0; s >>= 1) {
+        if (gi < s) { gsSensorSum[gi] += gsSensorSum[gi + s]; gsSensorStray[gi] += gsSensorStray[gi + s]; }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0 && pixel.x < w && pixel.y < h) {
+        float3 prev = SensorImage[pixel].rgb;   // r = shown, g = clean, b = stray
+        float blend = saturate(_SensorBlend);
+        float clean = lerp(prev.g, gsSensorSum[0] / (float)(n * n), blend);
+        float stray = _StrayThisFrame > 0.5f ? lerp(prev.b, gsSensorStray[0] / (float)(n * n), blend) : prev.b;   // 25_0: keep the last stray value
+        float shown = _SensorView == 1 ? clean : (_SensorView == 2 ? stray : clean + stray);
+        SensorImage[pixel] = float4(shown, clean, stray, 1.0f);
+    }
+}
+
+[numthreads(4, 4, 1)]
+void CSSensor4(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID, uint gi : SV_GroupIndex) { SensorGroup(g.xy, t.xy, gi, 4); }
+[numthreads(8, 8, 1)]
+void CSSensor8(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID, uint gi : SV_GroupIndex) { SensorGroup(g.xy, t.xy, gi, 8); }
+[numthreads(16, 16, 1)]
+void CSSensor16(uint3 g : SV_GroupID, uint3 t : SV_GroupThreadID, uint gi : SV_GroupIndex) { SensorGroup(g.xy, t.xy, gi, 16); }
+
+
+// =====================================================================================================================
+// 33_0: BEAUTY RENDERER (main view only). Everything above this line is the 32_0 code, unchanged: the sensor kernels
+// (CSSensor4 / 8 / 16) and every hit test are the same, so the sensor image and all physics results are the same.
+// What is new below:
+//   - CSMain: a path tracer in linear RGB. Every object has a physical material (base color, metallic, roughness)
+//     and keeps bouncing light. Lights: the LED, up to 3 soft studio lights (sampled directly, with shadow rays),
+//     and an environment (your HDRI, or a built-in studio).
+//   - CSFinal: exposure, white balance and the tone curve (AgX, ACES or Reinhard).
+//   Not in this version (later phases): rounded geometry, depth of field, bloom, denoiser.
+// =====================================================================================================================
+#define PI33 3.14159265f
+
+int    _SamplesPerFrame;             // camera rays per pixel in one frame
+int    _PathBounces;                 // most surface bounces of one path
+float  _PaperShadows;                // 1 = paper fibers cast LED shadows in the main view (slow)
+float  _FireflyClamp;                // brightest value one bounced contribution may add
+float  _UseEnvMap;                   // 1 = _EnvMap, 0 = built-in studio
+float  _EnvIntensity;
+float  _EnvRotation;                 // radians, around Y
+Texture2D<float4> _EnvMap;           // equirectangular HDRI
+SamplerState sampler_EnvMap;
+// 34_0 phase 5: geometry
+float  _RealGeo34;                   // 1 = rounded case shell, LED body and pins (exact ray tests)
+float  _LedRound34;                  // LED body edge radius (units)
+float  _PinRound34;                  // pin edge radius, share of the pin thickness
+Texture2D<float> _CaseMarkTex;       // marking text (made in C#), 1 = ink
+SamplerState sampler_CaseMarkTex;
+float  _MarkTexOn;                   // 1 = real text, 0 = dot pattern as in 31_0
+float  _MarkAspect;                  // text picture height / width
+float  _ShowPcb34;                   // 1 = circuit board above the chip
+float4 _PcbCenter;
+float4 _PcbHalf;
+// 34_0 phase 6: camera
+float  _ApertureRadius;              // camera lens radius (units). 0 = pinhole, everything sharp
+float  _FocusDist;                   // distance of the sharp plane along the camera forward (units)
+float  _AutoFocus;                   // 1 = focus on whatever is at the screen center
+RWStructuredBuffer<float> _FocusBuf; // [0] = autofocus distance, found once per frame by CSFocus
+// 35_0 phase 7
+RWTexture2D<float4> GuideN;          // first hit: normal toward the camera (xyz), distance (w)
+RWTexture2D<float4> GuideA;          // first hit: base color (rgb)
+int    _PreviewStep;                 // 1 = every pixel; 2 or 4 = one path per 2 x 2 / 4 x 4 block (fast preview)
+float4 _BackdropColor;               // what the camera sees where it hits nothing (solid mode)
+float4 _FloorColor;                  // ground plane base color
+float  _BackgroundMode;              // 0 = solid backdrop color, 1 = environment
+int    _StudioCount;
+float4 _StudioPos[3];                // center
+float4 _StudioN[3];                  // unit normal, toward the scene
+float4 _StudioU[3];                  // xyz = unit edge direction, w = half size
+float4 _StudioV[3];
+float4 _StudioColor[3];              // emitted radiance (rgb)
+float  _LedViewStrength;             // LED light in the main view (1 = same paper brightness as 32_0)
+float4 _Rough;                       // roughness: x = molded case, y = gold, z = die, w = LED epoxy
+
+struct Mat33 {
+    float3 base;       // base color
+    float  metallic;   // 0 = plastic / ceramic, 1 = metal
+    float  rough;      // 0 = mirror, 1 = matte
+    float  spec;       // 1 = normal plastic reflection (4 %), 0 = none
+    float3 emission;
+    float3 n;          // shading normal
+};
+
+float Lum33(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+// ---------- materials ----------
+// Sensor case (materials 19 and 14 on the housing): same zones as 31_0, now as a physical material.
+void CaseMaterial(float3 pos, float3 n, bool hull, inout Mat33 m) {
+    float3 c = _HousingCenter;
+    float hw = _HousingSize.x, hd = _HousingSize.z;
+    float y0 = c.y, y1 = _PinPlace.z;
+    float yFloorTop = y0 + _HousingFloor;
+    float yw = min(_HousingWallBottom, y0);
+    float3 rel = pos - c;
+    float eps = 3.0f * T_EPS;
+    bool outerX = abs(rel.x) >= hw - eps;
+    bool outerZ = abs(rel.z) >= hd - eps;
+    bool topFace = n.y > 0.5f && pos.y >= y1 - eps;
+    bool floorUnder = n.y < -0.5f && abs(pos.y - y0) < eps && !outerX && !outerZ;
+    bool outerSide = (abs(n.x) > 0.5f && outerX) || (abs(n.z) > 0.5f && outerZ);
+    if (hull) {   // 34_0: a point on the real rounded outer shell: sorted by its true normal
+        topFace = n.y > 0.7f;
+        floorUnder = false;
+        outerSide = !topFace && n.y > -0.7f;
+    }
+
+    if ((outerSide || topFace) && _CaseBevel > 0.0f && !hull) {   // rounded edges: tilt the normal near the outer edges
+        float3 add = float3(0.0f, 0.0f, 0.0f);
+        float dx = hw - abs(rel.x), dz = hd - abs(rel.z);
+        if (abs(n.x) < 0.5f && dx < _CaseBevel) add.x += sign(rel.x) * (1.0f - dx / _CaseBevel);
+        if (abs(n.z) < 0.5f && dz < _CaseBevel) add.z += sign(rel.z) * (1.0f - dz / _CaseBevel);
+        if (abs(n.y) < 0.5f && y1 - pos.y < _CaseBevel) add.y += 1.0f - (y1 - pos.y) / _CaseBevel;
+        if (abs(n.y) < 0.5f && pos.y - yw < _CaseBevel) add.y -= 1.0f - (pos.y - yw) / _CaseBevel;
+        n = normalize(n + add);
+    }
+
+    float3 pm = pos / MM_TO_UNIT;
+    float2 uvp = abs(n.y) > 0.5f ? pm.xz : (abs(n.x) > 0.5f ? pm.zy : pm.xy);
+    float grain = 0.6f * ValueNoise(uvp * 90.0f) + 0.4f * ValueNoise(uvp * 260.0f);
+    float fleck = step(0.985f, Hash21(floor(uvp * 300.0f)));
+    float3 grey = float3(0.40f, 0.41f, 0.42f) * (0.82f + 0.36f * grain) + fleck * 0.22f;
+    float3 black = float3(0.035f, 0.035f, 0.038f) * (0.85f + 0.3f * grain);
+
+    float3 albedo = black;
+    float rough = 0.6f;
+    if (topFace) {
+        albedo = grey;
+        rough = _Rough.x;
+        float2 q = rel.xz;
+        float s = min(hw, hd);
+        float rc = length(q);
+        if (rc < 0.13f * s) {   // center ejector hole: a real pit (normal tilts toward the middle)
+            albedo = rc < 0.10f * s ? float3(0.03f, 0.03f, 0.03f) : grey * 0.45f;
+            n = normalize(float3(-q.x, 0.10f * s, -q.y));
+        }
+        [loop] for (int k = 0; k < 8; k++) {   // ring of 8 mold dimples, each a shallow pit
+            float a = (float)k * 0.785398f;
+            float2 dq = q - 0.42f * s * float2(cos(a), sin(a));
+            float rd = 0.045f * s;
+            if (dot(dq, dq) < rd * rd) { albedo = grey * 0.65f; n = normalize(float3(-dq.x, rd * 0.9f, -dq.y)); }
+        }
+        if (RingMask(q, float2(-0.62f * hw, 0.72f * hd), 0.09f * s, 0.02f * s) + RingMask(q, float2(-0.36f * hw, 0.72f * hd), 0.09f * s, 0.02f * s) > 0.5f) albedo = grey * 0.45f;
+        if (RingMask(q, float2(0.62f * hw, 0.70f * hd), 0.13f * s, 0.022f * s) > 0.5f) albedo = float3(0.70f, 0.71f, 0.72f);
+        if (abs(q.x - 0.62f * hw) < 0.02f * s && abs(q.y - 0.70f * hd) < 0.07f * s) albedo = float3(0.70f, 0.71f, 0.72f);
+        if (_MarkTexOn > 0.5f) {   // 34_0: real marking text, two lines, near the -Z edge
+            float mw = 1.2f * hw, mh = mw * _MarkAspect;
+            float2 muv = float2((q.x + 0.5f * mw) / mw, (q.y + 0.70f * hd + 0.5f * mh) / mh);
+            if (muv.x >= 0.0f && muv.x <= 1.0f && muv.y >= 0.0f && muv.y <= 1.0f)
+                albedo = lerp(albedo, float3(0.74f, 0.75f, 0.76f), saturate(_CaseMarkTex.SampleLevel(sampler_CaseMarkTex, muv, 0)));
+        }
+        else {
+        // laser marking: two rows of dot-matrix glyphs (lighter grey), near the -Z edge (as in 31_0)
+        float gh = 0.11f * s, gw = 0.065f * s, gap = 0.035f * s;
+        [loop] for (int row = 0; row < 2; row++) {
+            float vy = -0.50f * hd - (float)row * (gh + gap);
+            float2 lq = float2(q.x + 0.55f * hw, q.y - vy);
+            if (lq.x >= 0.0f && lq.y >= -gh * 0.5f && lq.y <= gh * 0.5f) {
+                float gi = floor(lq.x / (gw + gap));
+                float gx = lq.x - gi * (gw + gap);
+                if (gi < (row == 0 ? 5.0f : 4.0f) && gx < gw) {
+                    float2 cell = floor(float2(gx / gw * 3.0f, (lq.y / gh + 0.5f) * 5.0f));
+                    if (Hash21(cell + float2(gi * 7.0f + row * 31.0f, 3.0f)) > 0.42f) albedo = float3(0.72f, 0.73f, 0.74f);
+                }
+            }
+        }
+        }
+    }
+    else if (outerSide) {
+        if (pos.y < yFloorTop) { albedo = black; rough = 0.6f; } else { albedo = grey; rough = _Rough.x; }
+    }
+    else if (floorUnder) {
+        albedo = grey * 0.85f;
+        rough = _Rough.x;
+        float r = length(pos.xz - _PinholeXZ);
+        float R = _PinholeRadius;
+        if (r < 2.6f * R) { albedo = float3(0.62f, 0.46f, 0.13f) * (0.9f + 0.2f * grain); rough = 0.25f; }
+        if (r > 1.75f * R && r < 1.95f * R) albedo = float3(0.10f, 0.08f, 0.03f);
+        if (r > 2.45f * R && r < 2.6f * R) albedo = float3(0.85f, 0.70f, 0.30f);
+    }
+    m.base = albedo;
+    m.rough = rough;
+    m.n = n;
+}
+
+// LED body (material 17): same layout as 32_0, now as a physical material. The clear epoxy is a glossy surface whose
+// base color is what the bent view ray sees on the substrate under it (pads, die, bond wire). The die glow is emission.
+void LedMaterial(float3 pos, float3 nW, float3 rdW, bool glowOn, inout Mat33 m) {
+    float3 c = _LightPosition.xyz - _LedAim * _LedHalf.y;
+    float3 o = pos - c;
+    float3 lp = float3(dot(o, _LedAxisL), dot(o, _LedAim), dot(o, _LedAxisW));
+    float3 d  = float3(dot(rdW, _LedAxisL), dot(rdW, _LedAim), dot(rdW, _LedAxisW));
+    float3 n  = float3(dot(nW, _LedAxisL), dot(nW, _LedAim), dot(nW, _LedAxisW));
+    float hx = _LedHalf.x, hy = _LedHalf.y, hz = _LedHalf.z;
+    float yb = -hy + _LedBase;
+    float mm = MM_TO_UNIT;
+    float3 white = float3(0.80f, 0.78f, 0.72f);
+    float3 gold  = float3(1.00f, 0.71f, 0.29f);
+
+    if (lp.y < yb - T_EPS) {   // substrate base
+        float2 uvp = (abs(n.y) > 0.5f ? lp.xz : (abs(n.x) > 0.5f ? lp.zy : lp.xy)) / mm;
+        float grain = ValueNoise(uvp * 70.0f);
+        float termLen = min(0.45f * mm, 0.6f * hx);
+        m.base = white * (0.9f + 0.2f * grain);
+        m.rough = 0.55f;
+        if (abs(n.x) > 0.5f) { m.base = abs(lp.z) < 0.35f * hz ? gold * 0.35f : gold; m.metallic = 1.0f; m.rough = _Rough.y; }
+        else if (abs(lp.x) > hx - termLen) { m.base = gold; m.metallic = 1.0f; m.rough = _Rough.y; }
+        else if (n.y < -0.5f && abs(lp.x) < 0.12f * hx && abs(lp.z) < 0.6f * hz) m.base = float3(0.10f, 0.42f, 0.20f);
+        return;
+    }
+
+    // clear epoxy
+    m.rough = _Rough.w;
+    m.base = float3(0.30f, 0.33f, 0.34f);   // looking through to a far wall
+    float3 r = refract(d, n, 1.0f / 1.5f);
+    bool seesFloor = false;
+    if (r.y < -1e-4f) {
+        float t = (yb - lp.y) / r.y;
+        float3 q = lp + t * r;
+        if (abs(q.x) <= hx && abs(q.z) <= hz) {
+            seesFloor = true;
+            float3 col = white;
+            float padZ = 0.80f * hz;
+            bool padA = q.x < 0.18f * hx && abs(q.z) < padZ;
+            bool padB = q.x > 0.40f * hx && abs(q.z) < padZ;
+            if (padA || padB) col = gold * 0.85f;
+            if (q.x > 0.0f && q.x < 0.62f * hx && abs(q.z) < 0.02f * mm) col = float3(1.0f, 0.82f, 0.42f);
+            float dh = 0.15f * mm;
+            bool onDie = abs(q.x) < dh && abs(q.z) < dh;
+            if (onDie) col = length(q.xz) < 0.045f * mm ? gold : float3(0.09f, 0.09f, 0.11f);
+            m.base = col * 0.9f;
+            if (glowOn) {
+                float glow = (onDie ? 1.0f : 0.0f) + 0.35f * exp(-length(q.xz) / (0.22f * mm));
+                m.emission = LED_DISPLAY_COLOR * (_LedDieGlow * glow);
+            }
+        }
+    }
+    if (!seesFloor && glowOn) m.emission = LED_DISPLAY_COLOR * (_LedDieGlow * 0.04f);
+    if (n.y > 0.5f && abs(length(lp.xz) - _LedWindowRadius) < 0.02f * mm) m.base += 0.10f;   // edge of the round window
+}
+
+// 34_0: circuit board (material 21). Green solder mask with copper traces under it, white outline around the chip,
+// gold pads where the pins go through, tan board edge.
+void PcbMaterial34(float3 pos, float3 n, inout Mat33 m) {
+    m.rough = 0.30f;
+    if (abs(n.y) < 0.5f) { m.base = float3(0.55f, 0.50f, 0.30f); m.rough = 0.7f; return; }
+    float2 p = pos.xz / MM_TO_UNIT;
+    float trace = step(0.62f, frac(p.x * 1.6f + 0.35f * floor(p.y * 0.5f))) * step(0.5f, frac(p.y * 0.5f));
+    m.base = lerp(float3(0.015f, 0.16f, 0.06f), float3(0.04f, 0.30f, 0.12f), trace);
+    float2 rel = pos.xz - _HousingCenter.xz;
+    float2 dq = abs(rel) - (float2(_HousingSize.x, _HousingSize.z) + 0.15f * MM_TO_UNIT);
+    if (abs(max(dq.x, dq.y)) < 0.015f * MM_TO_UNIT) { m.base = float3(0.85f, 0.85f, 0.82f); m.rough = 0.6f; }
+    float L = max(_PinSize.z, _PinSize.y);
+    float px = _HousingSize.x + L - 0.5f * _PinSize.y;
+    [loop] for (int k = 0; k < 8; k++) {
+        float2 pc = float2((k < 4 ? -1.0f : 1.0f) * px, ((float)(k & 3) - 1.5f) * _PinPlace.y);
+        float r = length(rel - pc);
+        if (r < 0.12f * MM_TO_UNIT) { m.base = r < 0.05f * MM_TO_UNIT ? float3(0.25f, 0.20f, 0.12f) : float3(1.0f, 0.75f, 0.35f); m.metallic = 1.0f; m.rough = 0.3f; }
+    }
+}
+
+void GetMaterial33(HitRecord hit, float3 rd, out Mat33 m) {
+    m.base = float3(0.5f, 0.5f, 0.5f);
+    m.metallic = 0.0f;
+    m.rough = 0.5f;
+    m.spec = 1.0f;
+    m.emission = float3(0.0f, 0.0f, 0.0f);
+    m.n = hit.normal;
+    int id = hit.materialID;
+    if (id == 2)       { m.base = _FloorColor.rgb; m.rough = 0.75f; }
+    else if (id == 9)  { float r = SurfaceReflectance(hit.position); m.base = float3(r, r, r); m.rough = 1.0f; m.spec = 0.0f; }
+    else if (id == 14) { m.base = HOUSING_BLACK; m.rough = 0.6f; }
+    else if (id == 12) { m.base = float3(0.2f, 0.28f, 0.38f); m.rough = 0.3f; }   // lens drawn as a plain solid (Enable Lens Visuals off)
+    else if (id == 17) {
+        if (ShowObj(20)) LedMaterial(hit.position, hit.normal, rd, ShowObj(4), m);
+        else {
+            float depth = dot(hit.position - _LightPosition.xyz, _LedAim);
+            bool isBase = depth < -(2.0f * _LedHalf.y - _LedBase);
+            m.base = isBase ? float3(0.16f, 0.13f, 0.10f) : float3(0.55f, 0.60f, 0.62f);
+            m.rough = isBase ? 0.6f : 0.15f;
+        }
+    }
+    else if (id == 18) { m.base = float3(0.30f, 0.31f, 0.36f); m.metallic = 0.85f; m.rough = _Rough.z; }
+    else if (id == 19) CaseMaterial(hit.position, hit.normal, false, m);
+    else if (id == 22) CaseMaterial(hit.position, hit.normal, true, m);   // 34_0: rounded shell
+    else if (id == 21) PcbMaterial34(hit.position, hit.normal, m);        // 34_0: board
+    else if (id == 20) { m.base = float3(1.00f, 0.71f, 0.29f); m.metallic = 1.0f; m.rough = _Rough.y; }
+}
+
+// ---------- surface reflection model (diffuse + GGX highlight) ----------
+float3 F0Of(Mat33 m) { return lerp(float3(0.04f, 0.04f, 0.04f) * m.spec, m.base, m.metallic); }
+float AlphaOf(Mat33 m) { float r = clamp(m.rough, 0.04f, 1.0f); return r * r; }
+
+float SpecChance(Mat33 m, float NoV) {
+    float3 F = F0Of(m) + (1.0f - F0Of(m)) * pow(1.0f - NoV, 5.0f);
+    float fs = Lum33(F);
+    float fd = Lum33(m.base) * (1.0f - m.metallic);
+    return clamp(fs / max(fs + fd, 1e-5f), 0.1f, 0.9f);
+}
+
+// Reflected share of light arriving from L toward V, times cos(angle of L).
+float3 EvalBsdf33(Mat33 m, float3 N, float3 V, float3 L) {
+    float NoL = dot(N, L);
+    float NoV = max(dot(N, V), 1e-4f);
+    if (NoL <= 0.0f) return float3(0.0f, 0.0f, 0.0f);
+    float3 H = normalize(V + L);
+    float NoH = saturate(dot(N, H));
+    float VoH = saturate(dot(V, H));
+    float a = AlphaOf(m);
+    float a2 = a * a;
+    float dd = NoH * NoH * (a2 - 1.0f) + 1.0f;
+    float D = a2 / (PI33 * dd * dd);
+    float k = a * 0.5f;
+    float G = (NoV / (NoV * (1.0f - k) + k)) * (NoL / (NoL * (1.0f - k) + k));
+    float3 F0 = F0Of(m);
+    float3 F = F0 + (1.0f - F0) * pow(1.0f - VoH, 5.0f);
+    float3 spec = F * (D * G / (4.0f * NoV * NoL));
+    float3 diff = m.base * ((1.0f - m.metallic) / PI33);
+    return (diff + spec) * NoL;
+}
+
+// Chance (per solid angle) that SampleBsdf33 picks direction L.
+float PdfBsdf33(Mat33 m, float3 N, float3 V, float3 L) {
+    float NoL = dot(N, L);
+    if (NoL <= 0.0f) return 0.0f;
+    float NoV = max(dot(N, V), 1e-4f);
+    float3 H = normalize(V + L);
+    float NoH = saturate(dot(N, H));
+    float VoH = max(dot(V, H), 1e-4f);
+    float a = AlphaOf(m);
+    float a2 = a * a;
+    float dd = NoH * NoH * (a2 - 1.0f) + 1.0f;
+    float D = a2 / (PI33 * dd * dd);
+    float ps = SpecChance(m, NoV);
+    return ps * D * NoH / (4.0f * VoH) + (1.0f - ps) * NoL / PI33;
+}
+
+float3 SampleBsdf33(Mat33 m, float3 N, float3 V, inout uint rng) {
+    float NoV = max(dot(N, V), 1e-4f);
+    float3 dirOut;
+    if (NextRandom(rng) < SpecChance(m, NoV)) {
+        float a = AlphaOf(m);
+        float u = NextRandom(rng);
+        float ph = 6.2831853f * NextRandom(rng);
+        float cosT = sqrt((1.0f - u) / (1.0f + (a * a - 1.0f) * u));
+        float sinT = sqrt(saturate(1.0f - cosT * cosT));
+        float3 T = normalize(abs(N.y) < 0.9f ? cross(N, float3(0, 1, 0)) : cross(N, float3(1, 0, 0)));
+        float3 B = cross(N, T);
+        float3 H = normalize(T * (sinT * cos(ph)) + B * (sinT * sin(ph)) + N * cosT);
+        dirOut = reflect(-V, H);
+    }
+    else dirOut = CosineDir(N, rng);
+    return dirOut;
+}
+
+// ---------- environment ----------
+float3 EnvRadiance(float3 d) {
+    float cr = cos(_EnvRotation), sr = sin(_EnvRotation);
+    d = float3(cr * d.x - sr * d.z, d.y, sr * d.x + cr * d.z);
+    float2 uvE = float2(atan2(d.z, d.x) / 6.2831853f + 0.5f, acos(clamp(d.y, -1.0f, 1.0f)) / PI33);
+    float3 mapCol = _EnvMap.SampleLevel(sampler_EnvMap, uvE, 0).rgb;
+    // built-in studio: dim dome, one large soft box overhead, a warm strip and a cool strip at the sides, dark floor
+    float3 col = d.y > 0.0f ? lerp(float3(0.30f, 0.31f, 0.33f), float3(0.12f, 0.13f, 0.15f), saturate(d.y))
+                            : float3(0.07f, 0.07f, 0.075f);
+    if (d.y > 0.05f) {
+        float2 p = d.xz / d.y;
+        float box = (1.0f - smoothstep(0.55f, 0.75f, abs(p.x))) * (1.0f - smoothstep(0.35f, 0.50f, abs(p.y)));
+        col += float3(4.0f, 4.0f, 4.0f) * box;
+    }
+    float az = atan2(d.z, d.x);
+    float el = asin(clamp(d.y, -1.0f, 1.0f));
+    float elMask = smoothstep(0.05f, 0.15f, el) * (1.0f - smoothstep(0.75f, 0.95f, el));
+    float d1 = abs(atan2(sin(az - 1.0f), cos(az - 1.0f)));
+    float d2 = abs(atan2(sin(az + 2.2f), cos(az + 2.2f)));
+    col += float3(3.0f, 2.7f, 2.3f) * (1.0f - smoothstep(0.14f, 0.22f, d1)) * elMask;
+    col += float3(1.8f, 2.0f, 2.4f) * (1.0f - smoothstep(0.10f, 0.18f, d2)) * elMask;
+    return (_UseEnvMap > 0.5f ? mapCol : col) * _EnvIntensity;
+}
+
+// ---------- 34_0 phase 5: real rounded geometry ----------
+// Exact ray / rounded box test (after I. Quilez). ro, rd in box space; size = half size of the inner (sharp) box,
+// rad = edge radius. Returns t > 0 on a hit, -1 on a miss, -2 when the ray starts inside the rounded box.
+// Worked out from the point where the ray enters the bounding box, so the small radius keeps its precision.
+float RoundBox34(float3 ro, float3 rd, float3 size, float rad) {
+    rd += float3(abs(rd.x) < 1e-7f ? 1e-7f : 0.0f, abs(rd.y) < 1e-7f ? 1e-7f : 0.0f, abs(rd.z) < 1e-7f ? 1e-7f : 0.0f);
+    float3 qd = abs(ro) - size;
+    float sd = length(max(qd, 0.0f)) + min(max(qd.x, max(qd.y, qd.z)), 0.0f) - rad;
+    if (sd < 0.0f) return -2.0f;
+    float3 ext = size + rad;
+    float3 m = 1.0f / rd;
+    float3 n = m * ro;
+    float3 k = abs(m) * ext;
+    float3 t1 = -n - k, t2 = -n + k;
+    float tN = max(max(max(t1.x, t1.y), t1.z), 0.0f);
+    float tF = min(min(t2.x, t2.y), t2.z);
+    if (tN > tF) return -1.0f;
+    float3 pos = ro + tN * rd;
+    float3 s = pos >= 0.0f ? 1.0f : -1.0f;
+    float3 o = pos * s;
+    float3 r = rd * s;
+    float3 f = o - size;
+    f = max(f.xyz, f.yzx);
+    if (min(min(f.x, f.y), f.z) < 0.0f) return tN > 0.0f ? tN : -1.0f;   // flat face part
+    float3 oc = o - size;
+    float3 dd = r * r, oo = oc * oc, od = oc * r;
+    float ra2 = rad * rad;
+    float t = 1e20f;
+    { float b = od.x + od.y + od.z; float c = oo.x + oo.y + oo.z - ra2; float h = b * b - c; if (h > 0.0f) t = max(-b - sqrt(h), 0.0f); }
+    { float a = dd.y + dd.z; float b = od.y + od.z; float c = oo.y + oo.z - ra2; float h = b * b - a * c;
+      if (h > 0.0f) { h = (-b - sqrt(h)) / a; if (h >= 0.0f && h < t && abs(o.x + r.x * h) < size.x) t = h; } }
+    { float a = dd.z + dd.x; float b = od.z + od.x; float c = oo.z + oo.x - ra2; float h = b * b - a * c;
+      if (h > 0.0f) { h = (-b - sqrt(h)) / a; if (h >= 0.0f && h < t && abs(o.y + r.y * h) < size.y) t = h; } }
+    { float a = dd.x + dd.y; float b = od.x + od.y; float c = oo.x + oo.y - ra2; float h = b * b - a * c;
+      if (h > 0.0f) { h = (-b - sqrt(h)) / a; if (h >= 0.0f && h < t && abs(o.z + r.z * h) < size.z) t = h; } }
+    return t > 1e19f ? -1.0f : tN + t;
+}
+
+float3 RoundBoxNormal34(float3 p, float3 size) {
+    float3 s = p >= 0.0f ? 1.0f : -1.0f;
+    return s * normalize(max(abs(p) - size, 1e-9f));
+}
+
+// Axis-aligned rounded box in the scene
+void IntersectRoundAABB34(Ray ray, inout HitRecord hit, float3 bmin, float3 bmax, float rad, int matID) {
+    float3 c = 0.5f * (bmin + bmax), h = 0.5f * (bmax - bmin);
+    rad = min(rad, 0.49f * min(h.x, min(h.y, h.z)));
+    float t = RoundBox34(ray.origin - c, ray.direction, h - rad, rad);
+    if (t <= T_EPS || t >= hit.t) return;
+    hit.didIntersect = true;
+    hit.t = t;
+    hit.position = ray.origin + t * ray.direction;
+    hit.normal = RoundBoxNormal34(hit.position - c, h - rad);
+    hit.materialID = matID;
+}
+
+// LED body with rounded edges (same frame and window rule as IntersectLedBox)
+void IntersectLedRound34(Ray ray, inout HitRecord hit) {
+    float3 c = _LightPosition.xyz - _LedAim * _LedHalf.y;
+    float3 o = ray.origin - c;
+    float3 lo = float3(dot(o, _LedAxisL), dot(o, _LedAim), dot(o, _LedAxisW));
+    float3 ld = float3(dot(ray.direction, _LedAxisL), dot(ray.direction, _LedAim), dot(ray.direction, _LedAxisW));
+    float rad = min(_LedRound34, 0.45f * min(_LedHalf.x, min(_LedHalf.y, _LedHalf.z)));
+    float t = RoundBox34(lo, ld, _LedHalf - rad, rad);
+    if (t <= T_EPS || t >= hit.t) return;
+    float3 lp = lo + t * ld;
+    float3 n = RoundBoxNormal34(lp, _LedHalf - rad);
+    hit.didIntersect = true;
+    hit.t = t;
+    hit.position = ray.origin + t * ray.direction;
+    hit.normal = n.x * _LedAxisL + n.y * _LedAim + n.z * _LedAxisW;
+    hit.materialID = (n.y > 0.5f && dot(lp.xz, lp.xz) < _LedWindowRadius * _LedWindowRadius) ? 4 : 17;
+}
+
+// Gold pins with rounded edges (same layout as IntersectCasePins)
+void IntersectCasePins34(Ray ray, inout HitRecord bestHit, int matID) {
+    float3 c = _HousingCenter;
+    float hw = _HousingSize.x;
+    float w = _PinSize.x, t = _PinSize.y, rise = _PinSize.w;
+    float L = max(_PinSize.z, t);
+    float ye = _PinPlace.x, p = _PinPlace.y, yt = _PinPlace.z;
+    float rad = _PinRound34 * 0.5f * min(t, w);
+    float zHalf = 1.5f * p + 0.65f * w;
+    [loop] for (int s = 0; s < 2; s++) {
+        float sg = s == 0 ? -1.0f : 1.0f;
+        float xa = c.x + sg * hw, xb = c.x + sg * (hw + L);
+        float xc = c.x + sg * (hw + L - t);
+        float bt0, bt1; float3 bn;
+        if (!BoxSlab(ray, float3(min(xa, xb), ye, c.z - zHalf), float3(max(xa, xb), yt + rise, c.z + zHalf), bt0, bt1, bn)) continue;
+        if (bt0 >= bestHit.t) continue;
+        [loop] for (int k = 0; k < 4; k++) {
+            float zc = c.z + ((float)k - 1.5f) * p;
+            IntersectRoundAABB34(ray, bestHit, float3(min(xa, xb) - sg * rad, ye, zc - 0.65f * w), float3(max(xa, xb) - sg * rad, ye + t, zc + 0.65f * w), rad, matID);
+            IntersectRoundAABB34(ray, bestHit, float3(min(xc, xb), ye, zc - 0.5f * w), float3(max(xc, xb), yt + rise, zc + 0.5f * w), rad, matID);
+        }
+    }
+}
+
+// Sensor case: from outside, the rounded outer shell; through the open bottom (and the open top when the top face is
+// hidden), or for rays that start inside, the 32_0 walls, floor and pinhole.
+void IntersectCase34(Ray ray, inout HitRecord hit, int caseMat, bool floorOn, bool wallsOn, bool topOn) {
+    float3 c = _HousingCenter;
+    float hw = _HousingSize.x, hd = _HousingSize.z;
+    float yw = min(_HousingWallBottom, c.y);
+    float yTop = topOn ? _PinPlace.z + 2.0f * T_EPS : c.y + _HousingSize.y;
+    float rad = min(_CaseBevel, 0.45f * min(min(hw, hd), 0.5f * (yTop - yw)));
+    bool sharp = true;
+    if (wallsOn && rad > 1e-6f) {
+        float3 hc = float3(c.x, 0.5f * (yw + yTop), c.z);
+        float3 hh = float3(hw, 0.5f * (yTop - yw), hd);
+        float th = RoundBox34(ray.origin - hc, ray.direction, hh - rad, rad);
+        if (th > T_EPS) {
+            float3 q = ray.origin + th * ray.direction;
+            float3 nq = RoundBoxNormal34(q - hc, hh - rad);
+            float w = _HousingWall;
+            bool inner = abs(q.x - c.x) < hw - w && abs(q.z - c.z) < hd - w;
+            bool open = inner && ((nq.y < -0.5f) || (!topOn && nq.y > 0.5f));
+            if (!open) {
+                sharp = false;
+                if (th < hit.t) {
+                    hit.didIntersect = true;
+                    hit.t = th;
+                    hit.position = q;
+                    hit.normal = nq;
+                    hit.materialID = caseMat == 19 ? 22 : caseMat;
+                }
+            }
+        }
+        else if (th > -1.5f) sharp = false;   // misses the case
+    }
+    if (sharp) {
+        IntersectHousingParts(ray, hit, caseMat, floorOn, wallsOn);
+        if (topOn) IntersectCaseTop(ray, hit, caseMat);
+    }
+}
+
+void IntersectOpticsMV34(Ray ray, inout HitRecord hit, float3 lensCenter) {
+    if (_RealGeo34 < 0.5f) { IntersectOpticsMV(ray, hit, lensCenter); return; }
+    if (ShowObj(11)) IntersectSensorPlane(ray, hit, _SensorCenter, _SensorHalfSize.x, _SensorHalfSize.y, 10);
+    if (ShowObj(5))  IntersectLensCaps(ray, hit, lensCenter, 12);
+    if (ShowObj(6))  IntersectLensHolder(ray, hit, 12, 14);
+    IntersectCase34(ray, hit, ShowObj(19) ? 19 : 14, ShowObj(7), ShowObj(8), ShowObj(18));
+    if (ShowObj(9))  IntersectChipGlass(ray, hit, 12);
+    if (ShowObj(10)) IntersectChipDie(ray, hit, 18);
+    if (ShowObj(17)) IntersectCasePins34(ray, hit, 20);
+}
+
+void IntersectLed34(Ray ray, inout HitRecord hit) {
+    if (_RealGeo34 > 0.5f) IntersectLedRound34(ray, hit); else IntersectLedBox(ray, hit);
+}
+
+// ---------- scene ----------
+void IntersectStudio33(Ray ray, inout HitRecord hit) {
+    [loop] for (int i = 0; i < _StudioCount; i++) {
+        float3 n = _StudioN[i].xyz;
+        float denom = dot(n, ray.direction);
+        if (denom > -1e-6f) continue;   // lit side only
+        float t = dot(_StudioPos[i].xyz - ray.origin, n) / denom;
+        if (t <= T_EPS || t >= hit.t) continue;
+        float3 rel = ray.origin + t * ray.direction - _StudioPos[i].xyz;
+        if (abs(dot(rel, _StudioU[i].xyz)) > _StudioU[i].w || abs(dot(rel, _StudioV[i].xyz)) > _StudioV[i].w) continue;
+        hit.didIntersect = true;
+        hit.t = t;
+        hit.position = ray.origin + t * ray.direction;
+        hit.normal = n;
+        hit.materialID = 30 + i;
+    }
+}
+
+// All main-view objects. realPaper = follow the fiber height map (camera rays and rays through the optics);
+// otherwise the paper is a flat sheet at its mean height (bounce rays: much faster, looks the same).
+void SceneHit33(Ray ray, inout HitRecord hit, float3 lensCenter, bool realPaper, bool paperOn, bool lightsVisible) {
+    if (ShowObj(2)) IntersectPlane(ray, hit, float3(0.0f, -1.5f * MM_TO_UNIT, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+    {
+        HitRecord ledHit = hit;
+        IntersectLed34(ray, ledHit);
+        if (ShowObj(20) && ShowObj(3) && ledHit.materialID == 4) ledHit.materialID = 17;   // real LED look: the window is clear epoxy
+        if (ledHit.t < hit.t && ((ledHit.materialID == 17 && ShowObj(3)) || (ledHit.materialID == 4 && ShowObj(4)))) hit = ledHit;
+    }
+    IntersectOpticsMV34(ray, hit, lensCenter);
+    if (_ShowPcb34 > 0.5f) IntersectHousingBox(ray, hit, _PcbCenter.xyz - _PcbHalf.xyz, _PcbCenter.xyz + _PcbHalf.xyz, 21);
+    if (paperOn && ShowObj(0)) {
+        if (realPaper) IntersectRoughPatch(ray, hit, _PatchCenter, _PatchHalfSize, 9);
+        else if (ray.direction.y < -1e-6f) {
+            float t = (_PatchCenter.y - ray.origin.y) / ray.direction.y;
+            if (t > T_EPS && t < hit.t) {
+                float3 p = ray.origin + t * ray.direction;
+                if (abs(p.x - _PatchCenter.x) <= _PatchHalfSize && abs(p.z - _PatchCenter.z) <= _PatchHalfSize) {
+                    hit.didIntersect = true; hit.t = t; hit.position = p; hit.normal = float3(0.0f, 1.0f, 0.0f); hit.materialID = 9;
+                }
+            }
+        }
+    }
+    if (lightsVisible) IntersectStudio33(ray, hit);
+}
+
+// Is anything solid between a point and a light? Clear parts (lens, holder, chip glass) let the light through.
+bool Occluded33(float3 o, float3 d, float maxT, bool skipLed, bool roughPaper) {
+    Ray sr;
+    sr.origin = o;
+    sr.direction = d;
+    sr.wavelength = 0.0f;
+    HitRecord sh;
+    sh.didIntersect = false;
+    sh.t = maxT;
+    sh.position = float3(0, 0, 0);
+    sh.normal = float3(0, 0, 0);
+    sh.materialID = 0;
+    if (_RealGeo34 > 0.5f) IntersectCase34(sr, sh, 14, ShowObj(7), ShowObj(8), ShowObj(18));
+    else IntersectHousingParts(sr, sh, 14, ShowObj(7), ShowObj(8));
+    if (ShowObj(10)) IntersectChipDie(sr, sh, 18);
+    if (ShowObj(17)) { if (_RealGeo34 > 0.5f) IntersectCasePins34(sr, sh, 20); else IntersectCasePins(sr, sh, 20); }
+    if (_ShowPcb34 > 0.5f) IntersectHousingBox(sr, sh, _PcbCenter.xyz - _PcbHalf.xyz, _PcbCenter.xyz + _PcbHalf.xyz, 21);
+    if (ShowObj(18) && abs(d.y) > 1e-6f) {   // case top, from either side
+        float t = (_PinPlace.z + 2.0f * T_EPS - o.y) / d.y;
+        if (t > T_EPS && t < sh.t) {
+            float2 rel = o.xz + t * d.xz - _HousingCenter.xz;
+            if (abs(rel.x) <= _HousingSize.x && abs(rel.y) <= _HousingSize.z) { sh.didIntersect = true; sh.t = t; }
+        }
+    }
+    if (!skipLed && ShowObj(3)) IntersectLed34(sr, sh);
+    if (roughPaper && ShowObj(0)) IntersectRoughPatch(sr, sh, _PatchCenter, _PatchHalfSize, 9);
+    return sh.didIntersect;
+}
+
+// Light arriving straight from the lights at point P (LED + one studio light picked at random), already reflected toward V.
+float3 DirectLight33(float3 P, float3 Ng, float3 N, float3 V, Mat33 m, bool onPaper, inout uint rng) {
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+    float3 o = P + Ng * (onPaper ? _PaperTexel * 0.05f : 2.0f * T_EPS);
+    bool roughShadow = onPaper && _PaperShadows > 0.5f;
+
+    // LED: a point light with the cos^m beam. pi x strength gives the same paper brightness as PaperShade in 32_0.
+    if (_LedViewStrength > 0.0f) {
+        float3 toL = _LightPosition.xyz - P;
+        float d2 = max(dot(toL, toL), 1e-12f);
+        float3 L = toL * rsqrt(d2);
+        float beam = pow(saturate(dot(-L, _LedAim)), _LedBeamPower);
+        if (dot(N, L) > 0.0f && dot(Ng, L) > 0.0f && beam > 1e-4f) {
+            if (!Occluded33(o, L, sqrt(d2) - 2.0f * T_EPS, true, roughShadow))
+                sum += EvalBsdf33(m, N, V, L) * (LED_DISPLAY_COLOR * (PI33 * _LedViewStrength * beam * _PaperRefDist2 / d2));
+        }
+    }
+
+    // one studio light, weighted against the chance that a bounce ray would have found it (keeps both low-noise)
+    if (_StudioCount > 0) {
+        int i = min((int)(NextRandom(rng) * (float)_StudioCount), _StudioCount - 1);
+        float su = (2.0f * NextRandom(rng) - 1.0f) * _StudioU[i].w;
+        float sv = (2.0f * NextRandom(rng) - 1.0f) * _StudioV[i].w;
+        float3 lp = _StudioPos[i].xyz + _StudioU[i].xyz * su + _StudioV[i].xyz * sv;
+        float3 toL = lp - P;
+        float d2 = max(dot(toL, toL), 1e-12f);
+        float3 L = toL * rsqrt(d2);
+        float cosL = -dot(_StudioN[i].xyz, L);
+        if (cosL > 1e-4f && dot(N, L) > 0.0f && dot(Ng, L) > 0.0f) {
+            float area = 4.0f * _StudioU[i].w * _StudioV[i].w;
+            float pl = d2 / (cosL * area) / (float)_StudioCount;
+            float pb = PdfBsdf33(m, N, V, L);
+            float w = pl * pl / (pl * pl + pb * pb);
+            if (!Occluded33(o, L, sqrt(d2) - 2.0f * T_EPS, false, false))
+                sum += EvalBsdf33(m, N, V, L) * _StudioColor[i].rgb * (w / pl);
+        }
+    }
+    return sum;
+}
+
+float3 CamDir33(float2 uv) {
+    float4 clip = float4(uv.x * 2.0f - 1.0f, uv.y * 2.0f - 1.0f, 0.0f, 1.0f);
+    float4 v = mul(_CameraInverseProjection, clip);
+    v /= v.w;
+    return normalize(mul(_CameraToWorld, float4(v.xyz, 0.0f)).xyz);
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    AccumulationBuffer.GetDimensions(width, height);
+    uint stepP = (uint)clamp(_PreviewStep, 1, 8);   // 35_0: preview block size
+    uint2 pix = id.xy * stepP;
+    float stepF = (float)stepP;
+    if (pix.x >= width || pix.y >= height) return;
+
+    uint rngState = GenerateSeed(pix, width, _Time) ^ ((uint)_SampleIndex * 2654435761u);
+    gMarkView = ShowObj(1) ? 1.0f : 0.0f;
+    float3 lensCenter = float3(_SensorCenter.x, _LensY, _SensorCenter.z);
+    float3 camO = _CameraToWorld._m03_m13_m23;
+    float2 dims = float2(width, height);
+    // 34_0: camera frame and focus distance (autofocus: whatever is at the screen center)
+    float3 camR = normalize(_CameraToWorld._m00_m10_m20);
+    float3 camU = normalize(_CameraToWorld._m01_m11_m21);
+    float3 camF = -normalize(_CameraToWorld._m02_m12_m22);
+    float focusD = _AutoFocus > 0.5f ? _FocusBuf[0] : _FocusDist;
+
+    // overlays (axes, chief-ray arrows): found once with the ray through the pixel center, always sharp, never lit
+    Ray cRay;
+    cRay.origin = camO;
+    cRay.direction = CamDir33((float2(pix) + 0.5f * stepF) / dims);
+    cRay.wavelength = 0.0f;
+    HitRecord ov;
+    ov.didIntersect = false;
+    ov.t = 1e20f;
+    ov.position = float3(0, 0, 0);
+    ov.normal = float3(0, 0, 0);
+    ov.materialID = 0;
+    if (ShowObj(16)) {
+        IntersectBillboardAxis(cRay, ov, float3(1.0f, 0.0f, 0.0f), 0.04f * MM_TO_UNIT, 5);
+        IntersectBillboardAxis(cRay, ov, float3(0.0f, 1.0f, 0.0f), 0.04f * MM_TO_UNIT, 6);
+        IntersectBillboardAxis(cRay, ov, float3(0.0f, 0.0f, 1.0f), 0.04f * MM_TO_UNIT, 7);
+    }
+    if (ShowObj(14) || ShowObj(15)) IntersectChiefVectors(cRay, ov);
+    float3 ovColor = float3(0.0f, 0.0f, 0.0f);
+    if (ov.didIntersect) {
+        if (ov.materialID == 5)       ovColor = float3(1.6f, 0.05f, 0.05f);
+        else if (ov.materialID == 6)  ovColor = float3(0.05f, 1.6f, 0.05f);
+        else if (ov.materialID == 7)  ovColor = float3(0.05f, 0.05f, 1.6f);
+        else ovColor = (ov.materialID == 15 ? float3(0.3f, 2.5f, 3.0f) : float3(3.0f, 1.5f, 0.2f)) * (0.45f + 0.55f * abs(dot(ov.normal, cRay.direction)));
+    }
+
+    // pixel positions: a low-discrepancy sequence shifted per pixel (cleaner edges and blur than plain random)
+    float2 pixShift = float2(Hash21(float2(pix) + 0.37f), Hash21(float2(pix.yx) + 11.13f));
+    int spp = clamp(_SamplesPerFrame, 1, 64);
+    int maxDepth = clamp(_PathBounces, 1, 12);
+
+    float3 sumRGB = float3(0.0f, 0.0f, 0.0f);
+    float3 sumN = float3(0.0f, 0.0f, 0.0f), sumA = float3(0.0f, 0.0f, 0.0f);   // 35_0: guide pictures
+    float sumZ = 0.0f;
+
+    [loop]
+    for (int s = 0; s < spp; s++)
+    {
+        float fi = (float)((((uint)max(_SampleIndex - 1, 0)) * (uint)spp + (uint)s) & 0xFFFFu);
+        float2 jit = frac(pixShift + fi * float2(0.7548776662f, 0.5698402910f));
+        Ray ray;
+        ray.origin = camO;
+        ray.direction = CamDir33((float2(pix) + jit * stepF) / dims);
+        ray.wavelength = 0.0f;
+        if (_ApertureRadius > 0.0f) {   // 34_0: real aperture - rays start across the lens and meet on the focus plane
+            float3 focusP = camO + ray.direction * (focusD / max(dot(ray.direction, camF), 1e-3f));
+            float lr = sqrt(NextRandom(rngState)) * _ApertureRadius;
+            float la = 6.2831853f * NextRandom(rngState);
+            ray.origin = camO + camR * (lr * cos(la)) + camU * (lr * sin(la));
+            ray.direction = normalize(focusP - ray.origin);
+        }
+        float3 thr = float3(1.0f, 1.0f, 1.0f);
+        float3 L = float3(0.0f, 0.0f, 0.0f);
+        int depth = 0;                 // surface bounces so far (clear glass does not count)
+        bool sharp = true;             // the last turn was the camera, or clear glass: lights are seen at full strength
+        float lastPdf = 0.0f;
+        bool viaOptics = false;
+        bool fromPaper = false;
+        float3 gN = float3(0.0f, 0.0f, 0.0f), gA = float3(1.0f, 1.0f, 1.0f);
+        float gZ = 1e4f;
+
+        [loop]
+        for (int i = 0; i < 24; i++)
+        {
+            HitRecord hit;
+            hit.didIntersect = false;
+            hit.t = 1e20f;
+            hit.position = float3(0, 0, 0);
+            hit.normal = float3(0, 0, 0);
+            hit.materialID = 0;
+            SceneHit33(ray, hit, lensCenter, depth == 0 || viaOptics, !fromPaper, i > 0);
+            if (i == 0) {   // 35_0: what the camera sees first, for the denoiser
+                bool useOv = ov.didIntersect && ov.t < hit.t;
+                if (useOv || hit.didIntersect) {
+                    gN = useOv ? ov.normal : hit.normal;
+                    if (dot(gN, ray.direction) > 0.0f) gN = -gN;
+                    gZ = useOv ? ov.t : hit.t;
+                }
+            }
+
+            if (i == 0 && ov.didIntersect && ov.t < hit.t) {   // overlay in front
+                L = ovColor;
+                break;
+            }
+
+            if (!hit.didIntersect) {
+                float3 env = (depth == 0 && i == 0 && _BackgroundMode < 0.5f) ? _BackdropColor.rgb : EnvRadiance(ray.direction);
+                if (depth > 0) env = min(env, float3(_FireflyClamp, _FireflyClamp, _FireflyClamp) / max(thr, 1e-3f));
+                L += thr * env;
+                break;
+            }
+
+            int mid = hit.materialID;
+
+            if (mid >= 30) {   // a studio light found by a bounce ray
+                int li = mid - 30;
+                float w = 1.0f;
+                if (!sharp) {
+                    float cosL = max(-dot(_StudioN[li].xyz, ray.direction), 1e-4f);
+                    float pl = hit.t * hit.t / (cosL * 4.0f * _StudioU[li].w * _StudioV[li].w) / (float)max(_StudioCount, 1);
+                    w = lastPdf * lastPdf / (lastPdf * lastPdf + pl * pl);
+                }
+                L += thr * _StudioColor[li].rgb * w;
+                break;
+            }
+
+            if (mid == 4) {   // old-style glowing LED window (Real Led Look off): seen by the camera and in mirrors only
+                if (sharp) L += thr * LED_DISPLAY_COLOR * (4.0f * max(_LedDieGlow, 1.0f));
+                break;
+            }
+
+            if (mid == 10) {   // sensor plane overlay (image + grid), partly see-through
+                if (NextRandom(rngState) > _SensorOpacity) {
+                    if (ray.direction.y < 0.0f && ShowObj(9)) {
+                        float2 relG = abs(hit.position.xz - _ChipGlassCenter.xz);
+                        if (relG.x <= _ChipGlassHalf.x && relG.y <= _ChipGlassHalf.z) {
+                            float3 refrG = refract(ray.direction, float3(0.0f, 1.0f, 0.0f), 1.0f / _LensIndex);
+                            if (dot(refrG, refrG) > 1e-6f) ray.direction = normalize(refrG);
+                        }
+                    }
+                    ray.origin = hit.position + ray.direction * T_EPS;
+                    viaOptics = true;
+                    continue;
+                }
+                if (!sharp) break;   // not a light source for the rest of the scene
+                float3 sensorColor = _SensorColor.rgb;
+                float2 cells   = max(_SensorGridCells, float2(1.0f, 1.0f));
+                float2 gridUV  = (hit.position.xz - _SensorCenter.xz + _SensorHalfSize) / (2.0f * _SensorHalfSize);
+                float2 gridPos = gridUV * cells;
+                if (ShowObj(12)) {
+                    uint2 cellIdx = (uint2)clamp(floor(gridPos), float2(0.0f, 0.0f), cells - 1.0f);
+                    sensorColor = SensorImage[cellIdx].rrr * _SensorExposure;
+                }
+                if (ShowObj(13)) {
+                    float2 cellFrac = frac(gridPos);
+                    float2 distToLine = min(cellFrac, 1.0f - cellFrac);
+                    float2 distToEdge = min(gridPos, cells - gridPos);
+                    if (min(distToEdge.x, distToEdge.y) < _SensorBorderWidth * 0.5f) sensorColor = _SensorBorderColor.rgb;
+                    else if (min(distToLine.x, distToLine.y) < _SensorLineWidth * 0.5f) sensorColor = _SensorGridColor.rgb;
+                }
+                L += thr * max(sensorColor, 0.0f);
+                break;
+            }
+
+            if (mid == 12 && _EnableLensVisuals > 0.5f) {   // clear parts: lens, holder, chip glass. Reflect or pass (Fresnel)
+                float3 Ngl = hit.normal;
+                bool entering = dot(ray.direction, Ngl) < 0.0f;
+                if (!entering) Ngl = -Ngl;
+                float eta = entering ? (1.0f / _LensIndex) : _LensIndex;
+                float cosI = saturate(dot(-ray.direction, Ngl));
+                float F0g = pow((_LensIndex - 1.0f) / (_LensIndex + 1.0f), 2.0f);
+                float fres = F0g + (1.0f - F0g) * pow(1.0f - cosI, 5.0f);
+                float3 refr = refract(ray.direction, Ngl, eta);
+                bool tir = dot(refr, refr) < 1e-6f;
+                float3 newDirG = (tir || NextRandom(rngState) < fres) ? reflect(ray.direction, Ngl) : normalize(refr);
+                ray.origin = hit.position + newDirG * (T_EPS * 0.5f);
+                ray.direction = newDirG;
+                viaOptics = true;
+                continue;
+            }
+
+            // ---- solid surface ----
+            Mat33 m;
+            GetMaterial33(hit, ray.direction, m);
+            float3 V = -ray.direction;
+            float3 Ng = hit.normal;
+            if (dot(Ng, V) < 0.0f) Ng = -Ng;
+            float3 N = m.n;
+            if (dot(N, V) < 0.0f) N = Ng;   // shading normal turned away from the viewer: use the true face
+
+            if (i == 0) gA = max(m.base, 0.02f);   // 35_0
+            L += thr * m.emission;
+
+            float3 direct = thr * DirectLight33(hit.position, Ng, N, V, m, mid == 9, rngState);
+            if (depth > 0) direct = min(direct, float3(_FireflyClamp, _FireflyClamp, _FireflyClamp));
+            L += direct;
+
+            depth++;
+            if (depth >= maxDepth) break;
+
+            float3 newDir = SampleBsdf33(m, N, V, rngState);
+            if (dot(newDir, Ng) <= 0.0f) break;
+            float pdf = PdfBsdf33(m, N, V, newDir);
+            if (pdf < 1e-6f) break;
+            thr *= EvalBsdf33(m, N, V, newDir) / pdf;
+            lastPdf = pdf;
+            sharp = false;
+            fromPaper = mid == 9;
+            viaOptics = false;
+            ray.origin = hit.position + Ng * (mid == 9 ? _PaperTexel * 0.05f : 2.0f * T_EPS);
+            ray.direction = newDir;
+
+            if (depth >= 2) {   // weak paths end at random; the survivors are boosted so the average stays right
+                float pSurvive = clamp(max(thr.x, max(thr.y, thr.z)), 0.05f, 1.0f);
+                if (NextRandom(rngState) > pSurvive) break;
+                thr /= pSurvive;
+            }
+        }
+
+        if (!(L.x + L.y + L.z < 1e30f)) L = float3(0.0f, 0.0f, 0.0f);   // drop a broken sample
+        sumRGB += L;
+        sumN += gN;
+        sumA += gA;
+        sumZ += gZ;
+    }
+
+    float inv = 1.0f / (float)spp;
+    float3 frameRGB = sumRGB * inv;
+
+    float4 gNew = float4(sumN * inv, sumZ * inv);
+    float4 aNew = float4(sumA * inv, 1.0f);
+    [loop] for (uint by = 0; by < stepP; by++) {   // 35_0: preview writes the whole block
+        [loop] for (uint bx = 0; bx < stepP; bx++) {
+            uint2 q = pix + uint2(bx, by);
+            if (q.x >= width || q.y >= height) continue;
+            float4 prevAccum = AccumulationBuffer[q];
+            float prevCount = min(prevAccum.w, (float)(_SampleIndex - 1));
+            float blendFactor = 1.0f / (prevCount + 1.0f);
+            AccumulationBuffer[q] = float4(lerp(prevAccum.xyz, frameRGB, blendFactor), prevCount + 1.0f);
+            GuideN[q] = lerp(GuideN[q], gNew, blendFactor);
+            GuideA[q] = lerp(GuideA[q], aNew, blendFactor);
+        }
+    }
+}
+
+// ---------- final picture: exposure, white balance, tone curve ----------
+Texture2D<float4> _PostSrc;          // accumulated linear picture
+float  _Exposure;                    // 2 ^ EV
+float4 _WhiteBalance;                // rgb gain
+// 34_0 phase 6
+Texture2D<float4> _BloomTex;         // glow picture (quarter size)
+SamplerState sampler_BloomTex;       // bilinear + clamp, from the texture settings
+float  _BloomStrength;
+float  _Vignette;                    // 0 = none, 1 = strong dark corners
+float  _ChromAb;                     // color fringe at the picture corners, in pixels
+int    _ToneMapper;                  // 0 = AgX, 1 = ACES, 2 = Reinhard
+
+float3 LinearToSRGB33(float3 c) {
+    c = saturate(c);
+    float3 lo = c * 12.92f;
+    float3 hi = 1.055f * pow(max(c, 1e-6f), 1.0f / 2.4f) - 0.055f;
+    return float3(c.x <= 0.0031308f ? lo.x : hi.x, c.y <= 0.0031308f ? lo.y : hi.y, c.z <= 0.0031308f ? lo.z : hi.z);
+}
+
+// AgX (the tone curve Blender uses by default), compact fit by B. Wrensch. Returns display values.
+float3 TonemapAgX33(float3 c) {
+    c = max(c, 1e-10f);
+    float3 v = float3(dot(c, float3(0.842479062253094f, 0.0784335999999992f, 0.0792237451477643f)),
+                      dot(c, float3(0.0423282422610123f, 0.878468636469772f, 0.0791661274605434f)),
+                      dot(c, float3(0.0423756549057051f, 0.0784336f, 0.879142973793104f)));
+    v = (clamp(log2(v), -12.47393f, 4.026069f) + 12.47393f) / 16.499999f;
+    float3 x2 = v * v, x4 = x2 * x2;
+    v = 15.5f * x4 * x2 - 40.14f * x4 * v + 31.96f * x4 - 6.868f * x2 * v + 0.4298f * x2 + 0.1191f * v - 0.00232f;
+    return saturate(float3(dot(v, float3(1.19687900512017f, -0.0980208811401368f, -0.0990297440797205f)),
+                           dot(v, float3(-0.0528968517574562f, 1.15190312990417f, -0.0989611768448433f)),
+                           dot(v, float3(-0.0529716355144438f, -0.0980434501171241f, 1.15107367264116f))));
+}
+
+[numthreads(8, 8, 1)]
+void CSFinal(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    Result.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float2 uv = (float2(id.xy) + 0.5f) / float2(w, h);
+    float2 vq = (uv - 0.5f) * 2.0f;
+    float3 c = _PostSrc[id.xy].rgb;
+    if (_ChromAb > 0.0f) {   // 34_0: red and blue shifted a little apart toward the corners, as in a real lens
+        int2 off = int2(round(vq * (0.5f * dot(vq, vq) * _ChromAb)));
+        int2 maxP = int2(w, h) - 1;
+        c.r = _PostSrc[clamp(int2(id.xy) + off, int2(0, 0), maxP)].r;
+        c.b = _PostSrc[clamp(int2(id.xy) - off, int2(0, 0), maxP)].b;
+    }
+    c *= _Exposure;
+    if (_BloomStrength > 0.0f) c += _BloomTex.SampleLevel(sampler_BloomTex, uv, 0).rgb * _BloomStrength;
+    c *= _WhiteBalance.rgb;
+    c *= 1.0f - _Vignette * smoothstep(0.35f, 1.6f, dot(vq, vq));
+    c = max(c, 0.0f);
+    float3 outC;
+    if (_ToneMapper == 0)      outC = TonemapAgX33(c);
+    else if (_ToneMapper == 1) outC = LinearToSRGB33((c * (2.51f * c + 0.03f)) / (c * (2.43f * c + 0.59f) + 0.14f));
+    else                       outC = LinearToSRGB33(c / (c + 1.0f));
+    Result[id.xy] = float4(outC, 1.0f);
+}
+
+// ---------- 34_0 bloom: glow around very bright spots (quarter-size picture) ----------
+RWTexture2D<float4> _BloomDst;
+Texture2D<float4> _BloomSrc;
+int2  _BlurDir;                      // (step, 0) or (0, step)
+float _BloomThreshold;               // brightness (after exposure) where the glow starts
+
+[numthreads(8, 8, 1)]
+void CSBloomPre(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    _BloomDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    uint sw, sh;
+    _PostSrc.GetDimensions(sw, sh);
+    int2 maxP = int2(sw, sh) - 1;
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+    [loop] for (int y = 0; y < 4; y++)
+        [loop] for (int x = 0; x < 4; x++)
+            sum += _PostSrc[clamp(int2(id.xy) * 4 + int2(x, y), int2(0, 0), maxP)].rgb;
+    float3 c = sum * (_Exposure / 16.0f);
+    float l = Lum33(c);
+    c *= max(l - _BloomThreshold, 0.0f) / max(l, 1e-4f);
+    _BloomDst[id.xy] = float4(min(c, float3(64.0f, 64.0f, 64.0f)), 1.0f);
+}
+
+[numthreads(8, 8, 1)]
+void CSBloomBlur(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    _BloomDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    int2 maxP = int2(w, h) - 1;
+    static const float gw[5] = { 0.2270270f, 0.1945946f, 0.1216216f, 0.0540541f, 0.0162162f };
+    float3 sum = _BloomSrc[id.xy].rgb * gw[0];
+    [loop] for (int k = 1; k < 5; k++) {
+        sum += _BloomSrc[clamp(int2(id.xy) + _BlurDir * k, int2(0, 0), maxP)].rgb * gw[k];
+        sum += _BloomSrc[clamp(int2(id.xy) - _BlurDir * k, int2(0, 0), maxP)].rgb * gw[k];
+    }
+    _BloomDst[id.xy] = float4(sum, 1.0f);
+}
+
+// ---------- 34_0 autofocus: one thread finds what is at the screen center ----------
+[numthreads(1, 1, 1)]
+void CSFocus(uint3 id : SV_DispatchThreadID) {
+    float3 lensCenter = float3(_SensorCenter.x, _LensY, _SensorCenter.z);
+    float3 camF = -normalize(_CameraToWorld._m02_m12_m22);
+    Ray fr;
+    fr.origin = _CameraToWorld._m03_m13_m23;
+    fr.direction = CamDir33(float2(0.5f, 0.5f));
+    fr.wavelength = 0.0f;
+    HitRecord fh;
+    fh.didIntersect = false;
+    fh.t = 1e20f;
+    fh.position = float3(0, 0, 0);
+    fh.normal = float3(0, 0, 0);
+    fh.materialID = 0;
+    SceneHit33(fr, fh, lensCenter, false, true, false);
+    _FocusBuf[0] = fh.didIntersect ? fh.t * max(dot(fr.direction, camF), 1e-3f) : _FocusDist;
+}
+
+// ---------- 35_0 denoiser: edge-aware blur, 5 x 5 taps, run several times with a growing step ----------
+// Pixels are mixed only with neighbours that face the same way, sit at the same distance and have a similar
+// brightness, so edges and fine detail stay. The base color is divided out first and multiplied back at the end,
+// so printed patterns (marking, grain, paper ink) are not blurred, only the lighting noise.
+Texture2D<float4> _DnSrc;
+Texture2D<float4> _DnGuideN;
+Texture2D<float4> _DnGuideA;
+RWTexture2D<float4> _DnDst;
+int   _DnStep;         // tap spacing in pixels: 1, 2, 4, 8, 16
+float _DnColorSigma;   // how different two brightness values may be and still be mixed (shrinks as samples build up)
+int   _DnFirst;        // 1 = first pass: divide by the base color
+int   _DnLast;         // 1 = last pass: multiply the base color back
+
+[numthreads(8, 8, 1)]
+void CSDenoise(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    _DnDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    int2 p = int2(id.xy);
+    int2 maxP = int2(w, h) - 1;
+    float4 g0 = _DnGuideN[p];
+    float3 a0 = max(_DnGuideA[p].rgb, 0.02f);
+    float3 c0 = _DnSrc[p].rgb;
+    if (_DnFirst == 1) c0 /= a0;
+    float l0 = Lum33(c0);
+    static const float kw[5] = { 1.0f / 16.0f, 4.0f / 16.0f, 6.0f / 16.0f, 4.0f / 16.0f, 1.0f / 16.0f };
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+    float wsum = 0.0f;
+    bool bg0 = dot(g0.xyz, g0.xyz) < 0.25f;
+    [loop] for (int dy = -2; dy <= 2; dy++) {
+        [loop] for (int dx = -2; dx <= 2; dx++) {
+            int2 q = clamp(p + int2(dx, dy) * _DnStep, int2(0, 0), maxP);
+            float4 g1 = _DnGuideN[q];
+            float3 c1 = _DnSrc[q].rgb;
+            if (_DnFirst == 1) c1 /= max(_DnGuideA[q].rgb, 0.02f);
+            bool bg1 = dot(g1.xyz, g1.xyz) < 0.25f;
+            float wn = bg0 ? (bg1 ? 1.0f : 0.0f) : (bg1 ? 0.0f : pow(saturate(dot(normalize(g0.xyz), normalize(g1.xyz))), 64.0f));
+            float wz = bg0 ? 1.0f : exp(-abs(g0.w - g1.w) / (0.02f * g0.w + 1e-5f));
+            float wc = exp(-abs(l0 - Lum33(c1)) / (_DnColorSigma * (l0 + 0.05f) + 1e-4f));
+            float wgt = kw[dx + 2] * kw[dy + 2] * wn * wz * wc;
+            sum += c1 * wgt;
+            wsum += wgt;
+        }
+    }
+    float3 outC = wsum > 1e-6f ? sum / wsum : c0;
+    if (_DnLast == 1) outC *= a0;
+    _DnDst[p] = float4(outC, 1.0f);
+}

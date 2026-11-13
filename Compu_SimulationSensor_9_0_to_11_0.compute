@@ -1,0 +1,956 @@
+#pragma kernel CSMain
+#pragma kernel CSSensor
+
+#define SAMPLES_PER_FRAME 64
+#define GLASS_ENV_COLOR float3(2.0f, 2.2f, 2.6f)   // brightness of the environment reflected by the glass
+
+// --- Scale: 1 scene unit = 10 mm (1 cm) ---
+#define MM_TO_UNIT 0.1f
+#define T_EPS 0.0001f   // ray-hit tolerance (was 0.001 when 1 unit = 1 mm)
+
+// --- Arrow head (cone) at the end of each chief-ray vector ---
+#define ARROW_HEAD_RADIUS 3.0f    // cone base radius / drawn line radius
+#define ARROW_HEAD_LENGTH 3.0f    // cone length / cone base radius
+#define ARROW_HEAD_MAX    0.45f   // largest cone base radius / pixel spacing (keeps neighbouring cones apart)
+
+// --- Plane settings ---
+float3 _SensorCenter;        
+float2 _SensorHalfSize;      
+float2 _SensorGridCells;     
+float  _SensorGridEnabled;   
+float  _SensorLineWidth;     
+float  _SensorBorderWidth;   
+float4 _SensorColor;         
+float4 _SensorGridColor;     
+float4 _SensorBorderColor;   
+
+// Rough surface patch
+float3 _PatchCenter;         
+float  _PatchHalfSize;       
+float  _PatchAmplitude;      
+float  _PatchNoiseFrequency; 
+float4 _PatchLowColor;       
+float4 _PatchHighColor;       
+
+// Sensor housing (open top box, floor with a round pinhole)
+float3 _HousingCenter;       // x,z = axis of the housing, y = underside of the floor
+float3 _HousingSize;         // x = half width, y = total height, z = half depth
+float  _HousingWall;         // wall and floor thickness
+float  _PinholeRadius;       // radius of the hole in the middle of the floor
+
+// Chief-ray vectors (one per sensor pixel)
+float3 _RayApexTop;          // lens point on the sensor side (rear principal point)
+float3 _RayApexBottom;       // lens point on the surface side (front principal point)
+float  _FocusPlaneY;         // height of the surface the vectors end on
+float  _SurfaceRatio;        // object distance / image distance (surface offset per sensor offset)
+float  _VectorRadius;        // base thickness of the drawn vectors
+
+// Mouse optics
+float  _LensY;               
+float  _LensRadius;          
+float  _SensorImageDist;     
+float  _ObjectDist;          
+int    _SensorSamples;       
+float  _SensorBlend;         
+float  _ShowSensorImage;     
+float  _SensorExposure;      
+float  _ShowOptics;          
+float  _LensCurvRadius;      
+float  _LensThickness;       
+float  _LensEdge;            
+float  _LensIndex;           
+float  _LensFlange;          
+float  _UseRealLens;         
+float  _SensorOpacity;       
+float  _EnableLensVisuals;   // 1 = full optical lens refraction, 0 = simple 3D shaded surface
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+    float wavelength; 
+};
+
+struct HitRecord {
+    bool didIntersect;
+    float t;
+    float3 position;
+    float3 normal;
+    int materialID;    
+};
+
+RWTexture2D<float4> Result;              
+RWTexture2D<float4> AccumulationBuffer;  
+RWTexture2D<float4> SensorImage;         
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float _Time;
+int _SampleIndex;
+
+float4 _LightPosition;
+float _LightIntensity; 
+float _IntensityClamp; 
+
+// --- PRNG Subsystem ---
+uint GenerateSeed(uint2 id, uint width, float time) {
+    uint timeSeed = asuint(time);
+    uint state = id.y * width + id.x;
+    state ^= timeSeed;
+    state = state * 277803737u + 289133645u;
+    return state;
+}
+
+float NextRandom(inout uint state) {
+    state = state * 747796405u + 289133645u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (float)((word >> 22u) ^ word) / 4294967295.0f;
+}
+
+float3 RandomInUnitSphere(inout uint state) {
+    while (true) {
+        float3 p = float3(NextRandom(state)*2.0f-1.0f, NextRandom(state)*2.0f-1.0f, NextRandom(state)*2.0f-1.0f);
+        if (dot(p, p) < 1.0f) return p;
+    }
+    return float3(0,0,0);
+}
+
+float3 RotateAroundAxis(float3 v, float3 axis, float angle) {
+    axis = normalize(axis);
+    float s = sin(angle);
+    float c = cos(angle);
+    return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0f - c);
+}
+
+float Hash21(float2 p) {
+    float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031f);
+    p3 += dot(p3, p3.yzx + 33.33f);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float ValueNoise(float2 p) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0f - 2.0f * f); 
+    float a = Hash21(i);
+    float b = Hash21(i + float2(1, 0));
+    float c = Hash21(i + float2(0, 1));
+    float d = Hash21(i + float2(1, 1));
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+float SurfaceHeight(float2 xz) {
+    float h = 0.0f;
+    float amp = 0.5f;
+    float freq = _PatchNoiseFrequency;
+    [unroll]
+    for (int o = 0; o < 3; o++) {      
+        h += ValueNoise(xz * freq) * amp;
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    return h * _PatchAmplitude * 2.0f;
+}
+
+float EvaluateEmission(int matID, float wavelength) {
+    if (matID == 4) return _LightIntensity; 
+    return 0.0f;
+}
+
+float EvaluateSkyEmission(float wavelength, float3 rayDir) {
+    return 0.0f;
+}
+
+float3 WavelengthToXYZ(float wave) {
+    float x1 = 1.065f * exp(-0.5f * ((wave - 595.8f) / 33.4f) * ((wave - 595.8f) / 33.4f));
+    float x2 = 0.366f * exp(-0.5f * ((wave - 446.8f) / 18.2f) * ((wave - 446.8f) / 18.2f));
+    return float3(x1 + x2, 1.014f * exp(-0.5f * ((wave - 556.4f) / 40.4f) * ((wave - 556.4f) / 40.4f)), 1.839f * exp(-0.5f * ((wave - 446.8f) / 22.7f) * ((wave - 446.8f) / 22.7f)));
+}
+
+float3 XYZToRGB(float3 xyz) {
+    return float3(2.975424f * xyz.x - 1.402930f * xyz.y - 0.453346f * xyz.z, -0.923164f * xyz.x + 1.832263f * xyz.y + 0.035174f * xyz.z, 0.053158f * xyz.x - 1.936616f * xyz.y + 1.050730f * xyz.z);
+}
+
+// --- Intersections ---
+void IntersectSphere(Ray ray, inout HitRecord bestHit, float3 center, float radius, int matID) {
+    float3 oc = ray.origin - center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0f) return;
+    float t = -b - sqrt(discriminant);
+    if (t <= T_EPS) t = -b + sqrt(discriminant);
+    if (t > T_EPS && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = normalize(bestHit.position - center);
+        bestHit.materialID = matID;
+    }
+}
+
+void IntersectPlane(Ray ray, inout HitRecord bestHit, float3 planeOrigin, float3 planeNormal, int matID) {
+    float denom = dot(planeNormal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(planeOrigin - ray.origin, planeNormal) / denom;
+        if (t > T_EPS && t < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = ray.origin + t * ray.direction;
+            bestHit.normal = planeNormal; 
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+void IntersectSensorPlane(Ray ray, inout HitRecord bestHit, float3 center, float halfWidth, float halfDepth, int matID) {
+    float3 normal = float3(0.0f, -1.0f, 0.0f);
+    float denom = dot(normal, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = dot(center - ray.origin, normal) / denom;
+        if (t > T_EPS && t < bestHit.t) {
+            float3 hitPos = ray.origin + t * ray.direction;
+            float2 localPos = hitPos.xz - center.xz;
+            if (abs(localPos.x) <= halfWidth && abs(localPos.y) <= halfDepth) {
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = hitPos;
+                bestHit.normal = (denom < 0.0f) ? normal : -normal;
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectLensCap(Ray ray, inout HitRecord bestHit, float3 c, float sgn, int matID) {
+    float R = _LensCurvRadius;
+    float3 sc = float3(c.x, c.y + sgn * (0.5f * _LensThickness - R), c.z);   
+    float3 oc = ray.origin - sc;
+    float b = dot(oc, ray.direction);
+    float cc = dot(oc, oc) - R * R;
+    float disc = b * b - cc;
+    if (disc < 0.0f) return;
+    float sq = sqrt(disc);
+    [unroll]
+    for (int j = 0; j < 2; j++) {
+        float t = (j == 0) ? (-b - sq) : (-b + sq);
+        if (t > T_EPS && t < bestHit.t) {
+            float3 p = ray.origin + t * ray.direction;
+            float2 dxz = p.xz - c.xz;
+            if (sgn * (p.y - c.y) >= 0.0f && dot(dxz, dxz) <= _LensRadius * _LensRadius * 1.0001f) {
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = p;
+                bestHit.normal = (p - sc) / R;
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectLensEdge(Ray ray, inout HitRecord bestHit, float3 c, int matID) {
+    float2 d = ray.direction.xz;
+    float a2 = dot(d, d);
+    if (a2 < 1e-8f) return;
+    float2 o = ray.origin.xz - c.xz;
+    float b = dot(o, d);
+    float cc = dot(o, o) - _LensRadius * _LensRadius;
+    float disc = b * b - a2 * cc;
+    if (disc < 0.0f) return;
+    float sq = sqrt(disc);
+    [unroll]
+    for (int j = 0; j < 2; j++) {
+        float t = ((j == 0) ? (-b - sq) : (-b + sq)) / a2;
+        if (t > T_EPS && t < bestHit.t) {
+            float3 p = ray.origin + t * ray.direction;
+            if (abs(p.y - c.y) <= 0.5f * _LensEdge * 1.0001f) {
+                float2 dxz = (p.xz - c.xz) / max(_LensRadius, 1e-6f);
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = p;
+                bestHit.normal = float3(dxz.x, 0.0f, dxz.y);
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectLensGlass(Ray ray, inout HitRecord bestHit, float3 c, int matID) {
+    IntersectLensCap(ray, bestHit, c,  1.0f, matID);
+    IntersectLensCap(ray, bestHit, c, -1.0f, matID);
+    IntersectLensEdge(ray, bestHit, c, matID);
+}
+
+void IntersectLensFlange(Ray ray, inout HitRecord bestHit, float3 c, int matID) {
+    if (abs(ray.direction.y) < 1e-6f) return;
+    float t = (c.y - ray.origin.y) / ray.direction.y;
+    if (t > T_EPS && t < bestHit.t) {
+        float3 p = ray.origin + t * ray.direction;
+        float2 d = p.xz - c.xz;
+        float r2 = dot(d, d);
+        float rIn = _LensRadius;
+        float rOut = _LensRadius + _LensFlange;
+        if (r2 >= rIn * rIn && r2 <= rOut * rOut) {
+            bestHit.didIntersect = true;
+            bestHit.t = t;
+            bestHit.position = p;
+            bestHit.normal = (ray.direction.y < 0.0f) ? float3(0, 1, 0) : float3(0, -1, 0);
+            bestHit.materialID = matID;
+        }
+    }
+}
+
+// --- Sensor housing ---
+// Ray against an axis-aligned box. Returns the entry and exit distances and the normal of the entry face.
+bool BoxSlab(Ray ray, float3 bmin, float3 bmax, out float t0, out float t1, out float3 n0) {
+    float3 invD = 1.0f / ray.direction;
+    float3 ta = (bmin - ray.origin) * invD;
+    float3 tb = (bmax - ray.origin) * invD;
+    float3 tmn = min(ta, tb);
+    float3 tmx = max(ta, tb);
+    t0 = max(max(tmn.x, tmn.y), tmn.z);
+    t1 = min(min(tmx.x, tmx.y), tmx.z);
+    if (tmn.x >= tmn.y && tmn.x >= tmn.z)      n0 = float3(-sign(ray.direction.x), 0.0f, 0.0f);
+    else if (tmn.y >= tmn.z)                   n0 = float3(0.0f, -sign(ray.direction.y), 0.0f);
+    else                                       n0 = float3(0.0f, 0.0f, -sign(ray.direction.z));
+    return t1 > t0 && t1 > T_EPS;
+}
+
+void IntersectHousingBox(Ray ray, inout HitRecord bestHit, float3 bmin, float3 bmax, int matID) {
+    float t0, t1; float3 n;
+    if (!BoxSlab(ray, bmin, bmax, t0, t1, n)) return;
+    if (t0 > T_EPS && t0 < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t0;
+        bestHit.position = ray.origin + t0 * ray.direction;
+        bestHit.normal = n;
+        bestHit.materialID = matID;
+    }
+}
+
+// Floor plate with a round hole (the pinhole) through its middle.
+void IntersectHousingFloor(Ray ray, inout HitRecord bestHit, float3 bmin, float3 bmax, float2 axisXZ, float holeR, int matID) {
+    float t0, t1; float3 n;
+    if (!BoxSlab(ray, bmin, bmax, t0, t1, n)) return;
+    if (t0 <= T_EPS) return;
+
+    float3 p = ray.origin + t0 * ray.direction;
+    float2 rel = p.xz - axisXZ;
+    if (dot(rel, rel) > holeR * holeR) {
+        if (t0 < bestHit.t) {
+            bestHit.didIntersect = true;
+            bestHit.t = t0;
+            bestHit.position = p;
+            bestHit.normal = n;
+            bestHit.materialID = matID;
+        }
+        return;
+    }
+
+    // The ray enters through the hole: it can still hit the wall of the hole before leaving the plate.
+    float2 d = ray.direction.xz;
+    float a = dot(d, d);
+    if (a < 1e-10f) return;                         // vertical ray: passes straight through
+    float2 o = ray.origin.xz - axisXZ;
+    float b = dot(o, d);
+    float cc = dot(o, o) - holeR * holeR;
+    float disc = b * b - a * cc;
+    if (disc < 0.0f) return;
+    float tw = (-b + sqrt(disc)) / a;               // where the ray leaves the hole
+    if (tw > t0 && tw < t1 && tw < bestHit.t) {
+        float3 pw = ray.origin + tw * ray.direction;
+        float2 rr = pw.xz - axisXZ;
+        bestHit.didIntersect = true;
+        bestHit.t = tw;
+        bestHit.position = pw;
+        bestHit.normal = float3(-rr.x, 0.0f, -rr.y) / max(holeR, 1e-6f);   // faces the axis
+        bestHit.materialID = matID;
+    }
+}
+
+// Open-top box: floor with the pinhole plus four walls.
+void IntersectHousing(Ray ray, inout HitRecord bestHit, int matID) {
+    float3 c = _HousingCenter;
+    float hw = _HousingSize.x;
+    float hd = _HousingSize.z;
+    float y0 = c.y;
+    float y1 = c.y + _HousingSize.y;
+    float w  = _HousingWall;
+
+    IntersectHousingFloor(ray, bestHit, float3(c.x - hw, y0, c.z - hd), float3(c.x + hw, y0 + w, c.z + hd), c.xz, _PinholeRadius, matID);
+    IntersectHousingBox(ray, bestHit, float3(c.x - hw,     y0, c.z - hd),     float3(c.x - hw + w, y1, c.z + hd),     matID);
+    IntersectHousingBox(ray, bestHit, float3(c.x + hw - w, y0, c.z - hd),     float3(c.x + hw,     y1, c.z + hd),     matID);
+    IntersectHousingBox(ray, bestHit, float3(c.x - hw + w, y0, c.z - hd),     float3(c.x + hw - w, y1, c.z - hd + w), matID);
+    IntersectHousingBox(ray, bestHit, float3(c.x - hw + w, y0, c.z + hd - w), float3(c.x + hw - w, y1, c.z + hd),     matID);
+}
+
+// --- Chief-ray vectors ---
+// Cone with its tip at V. axisA is the unit axis from the tip to the base. The base is a closed disc.
+void IntersectArrowHead(Ray ray, inout HitRecord bestHit, float3 V, float3 axisA, float len, float baseR, int matID) {
+    // Solved around the point of the ray nearest the tip: keeps float precision at this small size.
+    float tMid = dot(V - ray.origin, ray.direction);
+    float3 co = ray.origin + tMid * ray.direction - V;
+    float da = dot(ray.direction, axisA);
+    float ca = dot(co, axisA);
+    float k = baseR / len;
+    float cos2 = 1.0f / (1.0f + k * k);
+
+    float best = 1e20f;
+    float3 bestN = float3(0.0f, 0.0f, 0.0f);
+
+    // Side of the cone
+    float qa = da * da - cos2;
+    float qb = 2.0f * da * ca;
+    float qc = ca * ca - dot(co, co) * cos2;
+    float disc = qb * qb - 4.0f * qa * qc;
+    if (abs(qa) > 1e-9f && disc >= 0.0f) {
+        float sq = sqrt(disc);
+        [unroll]
+        for (int j = 0; j < 2; j++) {
+            float s = (-qb + ((j == 0) ? -sq : sq)) / (2.0f * qa);
+            float hgt = ca + s * da;                     // distance from the tip along the axis
+            if (hgt >= 0.0f && hgt <= len && s < best && tMid + s > T_EPS) {
+                float3 radial = co + s * ray.direction - axisA * hgt;
+                best = s;
+                bestN = normalize(normalize(radial) - axisA * k);
+            }
+        }
+    }
+
+    // Base disc
+    if (abs(da) > 1e-6f) {
+        float s = (len - ca) / da;
+        float3 rel = co + s * ray.direction - axisA * len;
+        if (dot(rel, rel) <= baseR * baseR && s < best && tMid + s > T_EPS) {
+            best = s;
+            bestN = axisA;
+        }
+    }
+
+    float t = tMid + best;
+    if (best < 1e19f && t < bestHit.t) {
+        bestHit.didIntersect = true;
+        bestHit.t = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal = bestN;
+        bestHit.materialID = matID;
+    }
+}
+
+// One arrow from A to Q: a thin line from A, then a cone whose tip is exactly at Q.
+// The line is drawn by closest approach between the camera ray and the segment.
+void TestVectorSegment(Ray ray, inout HitRecord bestHit, float3 A, float3 Q, float headMaxR, int matID) {
+    float3 full = Q - A;
+    float fullLen = length(full);
+    if (fullLen < 1e-6f) return;
+    float3 dirAQ = full / fullLen;
+
+    // Same growth with distance as the line, so the head stays visible with it.
+    float tTip = max(dot(Q - ray.origin, ray.direction), 0.0f);
+    float headR = min((_VectorRadius + tTip * 0.0006f) * ARROW_HEAD_RADIUS, headMaxR);
+    float headL = min(headR * ARROW_HEAD_LENGTH, 0.5f * fullLen);
+    IntersectArrowHead(ray, bestHit, Q, -dirAQ, headL, headR, matID);
+
+    float3 u = full - dirAQ * headL;                // the line stops at the base of the cone
+    float3 w0 = ray.origin - A;
+    float b = dot(ray.direction, u);
+    float c2 = dot(u, u);
+    float d = dot(ray.direction, w0);
+    float e = dot(u, w0);
+    float den = c2 - b * b;
+    if (den < 1e-12f) return;
+    float s = saturate((e - b * d) / den);
+    float t = s * b - d;
+    if (t <= T_EPS || t >= bestHit.t) return;
+    float3 diff = (ray.origin + t * ray.direction) - (A + s * u);
+    float r = _VectorRadius + t * 0.0006f;          // keeps the lines visible at any distance
+    if (dot(diff, diff) > r * r) return;
+    bestHit.didIntersect = true;
+    bestHit.t = t;
+    bestHit.position = ray.origin + t * ray.direction;
+    bestHit.normal = -ray.direction;
+    bestHit.materialID = matID;
+}
+
+// Lattice node (i,j) = (qStart.x + i*qStep.x, yPlane, qStart.y + j*qStep.y).
+// Only the nodes next to the plane that holds both the apex and the camera ray can be hit,
+// so each row (or column) tests two nodes instead of all of them.
+void IntersectVectorFan(Ray ray, inout HitRecord bestHit, float3 A, float yPlane, float2 qStart, float2 qStep, int nx, int nz, int matID) {
+    float3 m = cross(ray.origin - A, ray.direction);
+    if (dot(m, m) < 1e-14f) return;
+    float c = m.y * (yPlane - A.y);
+    float headMaxR = ARROW_HEAD_MAX * min(abs(qStep.x), abs(qStep.y));
+
+    if (abs(m.x * qStep.x) >= abs(m.z * qStep.y)) {
+        if (abs(m.x) < 1e-9f) return;
+        [loop]
+        for (int j = 0; j < nz; j++) {
+            float qz = qStart.y + j * qStep.y;
+            float qx = (-c - m.z * (qz - A.z)) / m.x + A.x;
+            int i0 = (int)floor((qx - qStart.x) / qStep.x);
+            [unroll]
+            for (int k = 0; k < 2; k++) {
+                int i = i0 + k;
+                if (i < 0 || i >= nx) continue;
+                TestVectorSegment(ray, bestHit, A, float3(qStart.x + i * qStep.x, yPlane, qz), headMaxR, matID);
+            }
+        }
+    } else {
+        if (abs(m.z) < 1e-9f) return;
+        [loop]
+        for (int i = 0; i < nx; i++) {
+            float qx = qStart.x + i * qStep.x;
+            float qz = (-c - m.x * (qx - A.x)) / m.z + A.z;
+            int j0 = (int)floor((qz - qStart.y) / qStep.y);
+            [unroll]
+            for (int k = 0; k < 2; k++) {
+                int j = j0 + k;
+                if (j < 0 || j >= nz) continue;
+                TestVectorSegment(ray, bestHit, A, float3(qx, yPlane, qStart.y + j * qStep.y), headMaxR, matID);
+            }
+        }
+    }
+}
+
+// Set 1 (ID 15): lens -> each sensor pixel.  Set 2 (ID 16): lens -> the surface point each pixel sees.
+void IntersectChiefVectors(Ray ray, inout HitRecord bestHit) {
+    int nx = (int)max(_SensorGridCells.x, 1.0f);
+    int nz = (int)max(_SensorGridCells.y, 1.0f);
+    float2 halfSz = _SensorHalfSize;
+    float2 pixStep = float2(2.0f * halfSz.x / nx, 2.0f * halfSz.y / nz);
+    float2 offset0 = float2(-halfSz.x + 0.5f * pixStep.x, -halfSz.y + 0.5f * pixStep.y);   // first pixel centre, relative to the sensor centre
+
+    // sensor side
+    float2 sensorStart = _SensorCenter.xz + offset0;
+    IntersectVectorFan(ray, bestHit, _RayApexTop, _SensorCenter.y, sensorStart, pixStep, nx, nz, 15);
+
+    // surface side: the lens inverts the image, so offsets are mirrored and scaled by object / image distance
+    float2 surfStart = _SensorCenter.xz - offset0 * _SurfaceRatio;
+    float2 surfStep  = -pixStep * _SurfaceRatio;
+    IntersectVectorFan(ray, bestHit, _RayApexBottom, _FocusPlaneY, surfStart, surfStep, nx, nz, 16);
+}
+
+void IntersectBillboardAxis(Ray ray, inout HitRecord bestHit, float3 axisDir, float width, int matID) {
+    float3 camForward = _CameraToWorld._m02_m12_m22;
+    float3 s = cross(axisDir, camForward);
+    if (dot(s, s) < 1e-4f) {
+        s = cross(axisDir, _CameraToWorld._m01_m11_m21); 
+    }
+    s = normalize(s);
+    float3 n = normalize(cross(axisDir, s));
+    
+    float denom = dot(n, ray.direction);
+    if (abs(denom) > 1e-6f) {
+        float t = -dot(n, ray.origin) / denom;
+        if (t > T_EPS && t < bestHit.t) {
+            float3 hitPos = ray.origin + t * ray.direction;
+            float sideCoord = dot(hitPos, s);
+            if (abs(sideCoord) <= width * 0.5f) {
+                bestHit.didIntersect = true;
+                bestHit.t = t;
+                bestHit.position = hitPos;
+                bestHit.normal = (denom < 0.0f) ? n : -n;
+                bestHit.materialID = matID;
+            }
+        }
+    }
+}
+
+void IntersectRoughPatch(Ray ray, inout HitRecord bestHit, float3 center, float halfSize, int matID) {
+    float minY = center.y;
+    float maxY = center.y + _PatchAmplitude * 2.0f;
+
+    float3 bmin = float3(center.x - halfSize, minY, center.z - halfSize);
+    float3 bmax = float3(center.x + halfSize, maxY, center.z + halfSize);
+    float3 invD = 1.0f / ray.direction;
+    float3 t0 = (bmin - ray.origin) * invD;
+    float3 t1 = (bmax - ray.origin) * invD;
+    float3 tsm = min(t0, t1);
+    float3 tbg = max(t0, t1);
+    float tEnter = max(max(tsm.x, tsm.y), max(tsm.z, T_EPS));
+    float tExit  = min(min(tbg.x, tbg.y), tbg.z);
+    if (tEnter >= tExit || tEnter > bestHit.t) return;
+
+    const int STEPS = 64;
+    float dt = (tExit - tEnter) / (float)STEPS;
+    float tPrev = tEnter;
+    float3 pPrev = ray.origin + tPrev * ray.direction;
+    float hPrev = pPrev.y - (center.y + SurfaceHeight(pPrev.xz - center.xz));
+
+    [loop]
+    for (int s = 1; s <= STEPS; s++) {
+        float tCur = tEnter + dt * s;
+        float3 pCur = ray.origin + tCur * ray.direction;
+        float hCur = pCur.y - (center.y + SurfaceHeight(pCur.xz - center.xz));
+
+        if (hPrev > 0.0f && hCur <= 0.0f) {
+            float tLo = tPrev, tHi = tCur;
+            [unroll]
+            for (int b = 0; b < 5; b++) {
+                float tMid = 0.5f * (tLo + tHi);
+                float3 pm = ray.origin + tMid * ray.direction;
+                float hm = pm.y - (center.y + SurfaceHeight(pm.xz - center.xz));
+                if (hm > 0.0f) tLo = tMid; else tHi = tMid;
+            }
+            float tHit = 0.5f * (tLo + tHi);
+
+            if (tHit < bestHit.t) {
+                float3 pos = ray.origin + tHit * ray.direction;
+                float2 q = pos.xz - center.xz;
+                float e = 0.005f * MM_TO_UNIT;
+                float h0 = SurfaceHeight(q);
+                float hx = SurfaceHeight(q + float2(e, 0)) - h0;
+                float hz = SurfaceHeight(q + float2(0, e)) - h0;
+                bestHit.didIntersect = true;
+                bestHit.t = tHit;
+                bestHit.position = pos;
+                bestHit.normal = normalize(float3(-hx, e, -hz));
+                bestHit.materialID = matID;
+            }
+            return;
+        }
+        tPrev = tCur;
+        hPrev = hCur;
+    }
+}
+
+float3 PatchColor(float3 pos, float3 normal) {
+    float3 L = normalize(_LightPosition.xyz - pos);
+    float ndl = saturate(dot(normal, L));
+    float hNorm = saturate((pos.y - _PatchCenter.y) / max(_PatchAmplitude * 2.0f, 1e-4f));
+    float3 baseColor = lerp(_PatchLowColor.rgb, _PatchHighColor.rgb, hNorm);
+    return baseColor * (0.15f + 1.5f * ndl);
+}
+
+[numthreads(8, 8, 1)]
+void CSSensor(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    SensorImage.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+
+    uint rng = GenerateSeed(id.xy, w, _Time);
+    float3 C = float3(_SensorCenter.x, _LensY, _SensorCenter.z);
+    float F0 = pow((_LensIndex - 1.0f) / (_LensIndex + 1.0f), 2.0f);
+    float sum = 0.0f;
+
+    [loop]
+    for (int smp = 0; smp < _SensorSamples; smp++) {
+        float2 pix = (float2(id.xy) + float2(NextRandom(rng), NextRandom(rng))) / float2(w, h);   
+        float3 P = float3(_SensorCenter.x + (pix.x * 2.0f - 1.0f) * _SensorHalfSize.x,
+                          _SensorCenter.y,
+                          _SensorCenter.z + (pix.y * 2.0f - 1.0f) * _SensorHalfSize.y);
+
+        float r = _LensRadius * sqrt(NextRandom(rng));
+        float a = 6.2831853f * NextRandom(rng);
+        float3 L = C + float3(r * cos(a), 0.0f, r * sin(a));          
+
+        Ray ray;
+        ray.wavelength = 0.0f;
+        float weight = 1.0f;
+
+        if (_UseRealLens > 0.5f) {
+            ray.origin = P;
+            ray.direction = normalize(L - P);
+            bool inside = false;
+            bool exited = false;
+            [loop]
+            for (int k = 0; k < 6; k++) {
+                HitRecord lh;
+                lh.didIntersect = false;
+                lh.t = 1e20f;
+                lh.position = float3(0, 0, 0);
+                lh.normal = float3(0, 0, 0);
+                lh.materialID = 0;
+                IntersectLensGlass(ray, lh, C, 12);
+                if (!lh.didIntersect) break;                           
+
+                float3 N = lh.normal;
+                bool entering = dot(ray.direction, N) < 0.0f;
+                if (!entering && !inside) break;
+                if (!entering) N = -N;
+
+                float eta = entering ? (1.0f / _LensIndex) : _LensIndex;
+                float cosI = saturate(dot(-ray.direction, N));
+                float fres = F0 + (1.0f - F0) * pow(1.0f - cosI, 5.0f);   
+                float3 refr = refract(ray.direction, N, eta);
+                if (dot(refr, refr) < 1e-6f) break;                    
+
+                weight *= (1.0f - fres);
+                ray.origin = lh.position;
+                ray.direction = normalize(refr);
+                inside = entering;
+                if (!entering) { exited = true; break; }
+            }
+            if (!exited) continue;
+        } else {
+            float3 F = C + (C - P) * (_ObjectDist / _SensorImageDist);    
+            ray.origin = L;
+            ray.direction = normalize(F - L);
+        }
+
+        HitRecord hit;
+        hit.didIntersect = false;
+        hit.t = 1e20f;
+        hit.position = float3(0, 0, 0);
+        hit.normal = float3(0, 0, 0);
+        hit.materialID = 0;
+        IntersectRoughPatch(ray, hit, _PatchCenter, _PatchHalfSize, 9);
+
+        if (hit.didIntersect) {
+            float3 c = PatchColor(hit.position, hit.normal);
+            sum += weight * dot(c, float3(0.299f, 0.587f, 0.114f));  
+        }
+    }
+
+    float value = sum / (float)max(_SensorSamples, 1);
+    float prev = SensorImage[id.xy].r;
+    float blended = lerp(prev, value, saturate(_SensorBlend));
+    SensorImage[id.xy] = float4(blended, blended, blended, 1.0f);
+}
+
+[numthreads(32, 32, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint width, height;
+    Result.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+    
+    uint rngState = GenerateSeed(id.xy, width, _Time);
+    float2 uvJitterAA = (float2(id.xy) + float2(NextRandom(rngState), NextRandom(rngState))) / float2(width, height);
+    
+    float4 jitterClip = float4(uvJitterAA.x * 2.0f - 1.0f, uvJitterAA.y * 2.0f - 1.0f, 0.0f, 1.0f);
+    float4 jitterView = mul(_CameraInverseProjection, jitterClip); 
+    jitterView /= jitterView.w;
+    
+    Ray jitterRay; 
+    jitterRay.origin = _CameraToWorld._m03_m13_m23;
+    jitterRay.direction = normalize(mul(_CameraToWorld, float4(jitterView.xyz, 0.0f)).xyz);
+    jitterRay.wavelength = 0.0f;
+
+    float3 lensCenter = float3(_SensorCenter.x, _LensY, _SensorCenter.z);
+
+    float3 accumulatedFrameRGB = float3(0.0f, 0.0f, 0.0f);
+    float skyPixelsAccumulator = 0.0f;
+
+    HitRecord patchHit;
+    patchHit.didIntersect = false;
+    patchHit.t = 1e20f;
+    patchHit.position = float3(0, 0, 0);
+    patchHit.normal = float3(0, 0, 0);
+    patchHit.materialID = 0;
+    IntersectRoughPatch(jitterRay, patchHit, _PatchCenter, _PatchHalfSize, 9); 
+
+    HitRecord vectorHit;
+    vectorHit.didIntersect = false;
+    vectorHit.t = 1e20f;
+    vectorHit.position = float3(0, 0, 0);
+    vectorHit.normal = float3(0, 0, 0);
+    vectorHit.materialID = 0;
+    if (_ShowOptics > 0.5f) IntersectChiefVectors(jitterRay, vectorHit);
+
+    [loop]
+    for (int smpl = 0; smpl < SAMPLES_PER_FRAME; smpl++) 
+    {
+        Ray ray;
+        ray.origin = jitterRay.origin;
+        ray.direction = jitterRay.direction;
+        ray.wavelength = 380.0f + NextRandom(rngState) * 400.0f;
+        
+        float throughput = 1.0f;
+        float finalSpectralRadiance = 0.0f;
+        bool sampleHitSkyDirectly = false;
+        int maxBounces = 8;          
+        bool viaOptics = false;      
+
+        [loop]
+        for (int i = 0; i < maxBounces; i++) 
+        {
+            HitRecord hit;
+            hit.didIntersect = false; 
+            hit.t = 1e20f;
+            hit.position = float3(0, 0, 0);
+            hit.normal = float3(0, 0, 0);
+            hit.materialID = 0;
+
+            IntersectPlane(ray, hit, float3(0.0f, -1.5f * MM_TO_UNIT, 0.0f), float3(0.0f, 1.0f, 0.0f), 2);
+            IntersectSphere(ray, hit, _LightPosition.xyz, 0.2f * MM_TO_UNIT, 4);
+
+            if (i == 0) {
+                IntersectBillboardAxis(ray, hit, float3(1.0f, 0.0f, 0.0f), 0.04f * MM_TO_UNIT, 5); 
+                IntersectBillboardAxis(ray, hit, float3(0.0f, 1.0f, 0.0f), 0.04f * MM_TO_UNIT, 6); 
+                IntersectBillboardAxis(ray, hit, float3(0.0f, 0.0f, 1.0f), 0.04f * MM_TO_UNIT, 7); 
+
+
+                if (_ShowOptics > 0.5f) {
+                    IntersectSensorPlane(ray, hit, _SensorCenter, _SensorHalfSize.x, _SensorHalfSize.y, 10);
+                    IntersectLensGlass(ray, hit, lensCenter, 12);
+                    IntersectLensFlange(ray, hit, lensCenter, 13);
+                    IntersectHousing(ray, hit, 14);
+                }
+
+                if (patchHit.didIntersect && patchHit.t < hit.t) hit = patchHit;
+                if (vectorHit.didIntersect && vectorHit.t < hit.t) hit = vectorHit;
+
+            }
+            else if (viaOptics && _ShowOptics > 0.5f) {
+                IntersectSensorPlane(ray, hit, _SensorCenter, _SensorHalfSize.x, _SensorHalfSize.y, 10);
+                IntersectLensGlass(ray, hit, lensCenter, 12);
+                IntersectLensFlange(ray, hit, lensCenter, 13);
+                IntersectHousing(ray, hit, 14);
+                IntersectRoughPatch(ray, hit, _PatchCenter, _PatchHalfSize, 9);
+            }
+
+            if (hit.didIntersect) {
+                if (hit.materialID == 4) {
+                    float rawEmission = EvaluateEmission(hit.materialID, ray.wavelength) * throughput;
+                    finalSpectralRadiance += min(rawEmission, _IntensityClamp);
+                    break;
+                }
+                
+                if (hit.materialID >= 5 && hit.materialID <= 7) {
+                    float3 axisColor = (hit.materialID == 5) ? float3(5.0f, 0.1f, 0.1f) :
+                                       (hit.materialID == 6) ? float3(0.1f, 5.0f, 0.1f) :
+                                                               float3(0.1f, 0.1f, 5.0f);
+                    
+                    float3 sceneSampleRGB = max(axisColor * throughput, 0.0f);
+                    accumulatedFrameRGB += sceneSampleRGB;
+                    sampleHitSkyDirectly = false;
+                    break;
+                }
+
+                if (hit.materialID == 10) {
+                    if (NextRandom(rngState) > _SensorOpacity) {
+                        ray.origin = hit.position + ray.direction * T_EPS;
+                        viaOptics = true;
+                        continue;
+                    }
+                    float3 sensorColor = _SensorColor.rgb;
+
+                    float2 cells    = max(_SensorGridCells, float2(1.0f, 1.0f));
+                    float2 gridUV   = (hit.position.xz - _SensorCenter.xz + _SensorHalfSize) / (2.0f * _SensorHalfSize); 
+                    float2 gridPos  = gridUV * cells;                       
+
+                    if (_ShowSensorImage > 0.5f) {
+                        uint2 cellIdx = (uint2)clamp(floor(gridPos), float2(0.0f, 0.0f), cells - 1.0f);
+                        sensorColor = SensorImage[cellIdx].rgb * _SensorExposure;
+                    }
+
+                    if (_SensorGridEnabled > 0.5f) {
+                        float2 cellFrac = frac(gridPos);
+                        float2 distToLine = min(cellFrac, 1.0f - cellFrac);     
+                        bool onLine   = min(distToLine.x, distToLine.y) < _SensorLineWidth * 0.5f;
+                        float2 distToEdge = min(gridPos, cells - gridPos);
+                        bool onBorder = min(distToEdge.x, distToEdge.y) < _SensorBorderWidth * 0.5f;
+                        if (onBorder)     sensorColor = _SensorBorderColor.rgb;
+                        else if (onLine)  sensorColor = _SensorGridColor.rgb;
+                    }
+                    float3 sceneSampleRGB = max(sensorColor * throughput, 0.0f);
+                    accumulatedFrameRGB += sceneSampleRGB;
+                    sampleHitSkyDirectly = false;
+                    break;
+                }
+
+                // --- Glass lens (ID 12): Switchable between simple 3D shaded surface & full optical refraction ---
+                if (hit.materialID == 12) {
+                    if (_EnableLensVisuals < 0.5f) {
+                        // Render as a simple 3D object with basic diffuse lighting / shading response
+                        float3 lightDir = normalize(_LightPosition.xyz - hit.position);
+                        float ndl = saturate(dot(hit.normal, lightDir));
+                        float3 simpleSurfaceColor = float3(0.2f, 0.28f, 0.38f) * (0.25f + 0.75f * ndl);
+                        
+                        accumulatedFrameRGB += max(simpleSurfaceColor * throughput, 0.0f);
+                        sampleHitSkyDirectly = false;
+                        break;
+                    }
+
+                    float3 N = hit.normal;
+                    bool entering = dot(ray.direction, N) < 0.0f;
+                    if (!entering) N = -N;
+                    float eta = entering ? (1.0f / _LensIndex) : _LensIndex;
+                    float cosI = saturate(dot(-ray.direction, N));
+                    float F0 = pow((_LensIndex - 1.0f) / (_LensIndex + 1.0f), 2.0f);
+                    float fres = F0 + (1.0f - F0) * pow(1.0f - cosI, 5.0f);
+                    float3 refr = refract(ray.direction, N, eta);
+                    bool tir = dot(refr, refr) < 1e-6f;
+
+                    if (!tir && NextRandom(rngState) < fres) {
+                        accumulatedFrameRGB += GLASS_ENV_COLOR * throughput;
+                        sampleHitSkyDirectly = false;
+                        break;
+                    }
+
+                    float3 newDir = tir ? reflect(ray.direction, N) : normalize(refr);
+                    ray.origin = hit.position + newDir * (T_EPS * 0.5f);
+                    ray.direction = newDir;
+                    viaOptics = true;
+                    continue;
+                }
+
+                if (hit.materialID == 15 || hit.materialID == 16) {
+                    float3 vectorColor = (hit.materialID == 15) ? float3(0.3f, 2.5f, 3.0f) : float3(3.0f, 1.5f, 0.2f);
+                    float vectorShade = 0.45f + 0.55f * abs(dot(hit.normal, ray.direction));   // lines stay at 1, cones get a 3D look
+                    accumulatedFrameRGB += max(vectorColor * vectorShade * throughput, 0.0f);
+                    sampleHitSkyDirectly = false;
+                    break;
+                }
+
+                if (hit.materialID == 14) {
+                    float3 housingLightDir = normalize(_LightPosition.xyz - hit.position);
+                    float housingNdl = saturate(dot(hit.normal, housingLightDir));
+                    float3 housingColor = float3(0.34f, 0.37f, 0.42f) * (0.3f + 0.7f * housingNdl);
+                    accumulatedFrameRGB += max(housingColor * throughput, 0.0f);
+                    sampleHitSkyDirectly = false;
+                    break;
+                }
+
+                if (hit.materialID == 13) {
+                    accumulatedFrameRGB += float3(0.35f, 0.37f, 0.42f) * throughput;
+                    sampleHitSkyDirectly = false;
+                    break;
+                }
+
+                if (hit.materialID == 9) {
+                    float3 sceneSampleRGB = PatchColor(hit.position, hit.normal) * throughput;
+                    accumulatedFrameRGB += max(sceneSampleRGB, 0.0f);
+                    sampleHitSkyDirectly = false;
+                    break;
+                }
+
+                if (hit.materialID == 2) {
+                    float3 targetDir = normalize(hit.normal + RandomInUnitSphere(rngState));
+                    ray.direction = targetDir;
+                    ray.origin = hit.position + hit.normal * T_EPS;
+                    throughput *= 0.8f;
+                    
+                    if (NextRandom(rngState) > throughput) break;
+                }
+            } else {
+                if (i == 0) sampleHitSkyDirectly = true;
+                else finalSpectralRadiance += EvaluateSkyEmission(ray.wavelength, ray.direction) * throughput;
+                break;
+            }        
+        }
+        
+        if (sampleHitSkyDirectly) {
+            skyPixelsAccumulator += 1.0f;
+        } else {
+            float3 sceneSampleRGB = max(XYZToRGB(WavelengthToXYZ(ray.wavelength) * finalSpectralRadiance * (400.0f * 0.00535f)), 0.0f);
+            sceneSampleRGB = min(sceneSampleRGB, float3(1e4f, 1e4f, 1e4f));
+            accumulatedFrameRGB += sceneSampleRGB;
+        }
+    }
+
+    float3 frameRGB = float3(0.0f, 0.0f, 0.0f);
+    bool hitSkyDirectly = (skyPixelsAccumulator / (float)SAMPLES_PER_FRAME) > 0.5f;
+    if (hitSkyDirectly) frameRGB = float3(0.0f, 0.0f, 0.0f);
+    else frameRGB = accumulatedFrameRGB / (float)SAMPLES_PER_FRAME;
+
+    float4 prevAccum = AccumulationBuffer[id.xy];
+    float prevCount = min(prevAccum.w, (float)(_SampleIndex - 1));
+
+    float newCount = prevCount + 1.0f;
+    float blendFactor = 1.0f / (prevCount + 1.0f);
+
+    float3 accumulatedRGB = lerp(prevAccum.xyz, frameRGB, blendFactor);
+    AccumulationBuffer[id.xy] = float4(accumulatedRGB, newCount);
+    
+    Result[id.xy] = float4(pow(accumulatedRGB / (accumulatedRGB + 1.0f), 1.0f / 2.2f), 1.0f);
+}
